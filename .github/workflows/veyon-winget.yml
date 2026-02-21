@@ -23,14 +23,8 @@ jobs:
       - name: Determine latest Veyon release & decide if update needed
         id: meta
         shell: pwsh
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
         run: |
-          $headers = @{
-            "User-Agent"    = "veyon-winget-bot"
-            "Accept"        = "application/vnd.github+json"
-            "Authorization" = "Bearer $env:GITHUB_TOKEN"
-          }
+          $headers = @{ "User-Agent" = "veyon-winget-bot"; "Accept" = "application/vnd.github+json" }
 
           # 1) Neueste Veyon Release holen
           $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/veyon/veyon/releases/latest" -Headers $headers
@@ -65,24 +59,41 @@ jobs:
             exit 0
           }
 
-          # 3) Prüfen ob Version schon in winget-pkgs vorhanden ist (Manifest-Ordner existiert)
-          $path = "manifests/v/VeyonSolutions/Veyon/$version"
-          $uri  = "https://api.github.com/repos/microsoft/winget-pkgs/contents/$path?ref=master"
-          $resp = Invoke-WebRequest -Uri $uri -Headers $headers -SkipHttpErrorCheck
+          # 3) ROBUSTER Check: Raw-Datei im winget-pkgs Repo (200 = vorhanden, 404 = nicht vorhanden)
+          # Hinweis: Im Repo liegt es unter manifests/v/... (lowercase v) – und diese Datei existiert für 4.10.1.0 nachweislich. 
+          $rawMaster = "https://raw.githubusercontent.com/microsoft/winget-pkgs/master/manifests/v/VeyonSolutions/Veyon/$version/VeyonSolutions.Veyon.installer.yaml"
+          $rawMain   = "https://raw.githubusercontent.com/microsoft/winget-pkgs/main/manifests/v/VeyonSolutions/Veyon/$version/VeyonSolutions.Veyon.installer.yaml"
 
-          switch ($resp.StatusCode) {
-            200 {
-              "needsUpdate=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-              Write-Host "Already present in winget-pkgs: $version"
-            }
-            404 {
-              "needsUpdate=true"  | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-              Write-Host "Not present in winget-pkgs yet: $version"
-            }
-            default {
-              throw "GitHub API returned $($resp.StatusCode) for $uri – aborting to avoid PR spam."
-            }
+          function Test-RawUrl([string]$url) {
+            $r = Invoke-WebRequest -Uri $url -Method Head -SkipHttpErrorCheck
+            return $r.StatusCode
           }
+
+          $code = Test-RawUrl $rawMaster
+          if ($code -eq 200) {
+            "needsUpdate=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            Write-Host "Already present in winget-pkgs (master): $version"
+            exit 0
+          }
+
+          if ($code -eq 404) {
+            # Fallback: falls branch mal "main" ist
+            $code2 = Test-RawUrl $rawMain
+            if ($code2 -eq 200) {
+              "needsUpdate=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+              Write-Host "Already present in winget-pkgs (main): $version"
+              exit 0
+            }
+            if ($code2 -eq 404) {
+              "needsUpdate=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+              Write-Host "Not present in winget-pkgs yet: $version"
+              exit 0
+            }
+
+            throw "Unexpected HTTP status $code2 for $rawMain – aborting to avoid PR spam."
+          }
+
+          throw "Unexpected HTTP status $code for $rawMaster – aborting to avoid PR spam."
 
       - name: Send START email (new version found)
         if: steps.meta.outputs.needsUpdate == 'true'
