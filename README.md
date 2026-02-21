@@ -41,4 +41,4 @@ Diese Secrets müssen in den Repository Settings hinterlegt werden:
 In GitHub unter **Actions** → Workflow auswählen → **Run workflow**.
 
 ## Hinweis / Sicherheit
-Das Repo ist öffentlich. Secrets werden ausschließlich über GitHub Actions Secrets genutzt. ;-)
+Da dieses Repo öffentlich ist werden Secrets ausschließlich über GitHub Actions Secrets genutzt. ;-)
