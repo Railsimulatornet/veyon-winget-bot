@@ -50,6 +50,7 @@ jobs:
 
       - name: Send START email (new version found)
         if: steps.meta.outputs.needsUpdate == 'true'
+        continue-on-error: true
         uses: dawidd6/action-send-mail@v3
         with:
           server_address: ${{ secrets.MAIL_SERVER }}
@@ -89,6 +90,7 @@ jobs:
 
       - name: Send END email (success/fail)
         if: always() && steps.meta.outputs.needsUpdate == 'true'
+        continue-on-error: true
         uses: dawidd6/action-send-mail@v3
         with:
           server_address: ${{ secrets.MAIL_SERVER }}
