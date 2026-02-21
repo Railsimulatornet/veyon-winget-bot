@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   # Häufiger Check -> praktisch "nahezu sofort" (max ~5–10 Minuten in der Praxis)
   schedule:
-    - cron: "2-59/5 * * * *" # alle 5 Minuten (UTC), nicht zur vollen Stunde
+  - cron: "*/5 * * * *"
   # Optional: externer Trigger (z.B. von deinem Server aus)
   repository_dispatch:
     types: [veyon_check_now]
