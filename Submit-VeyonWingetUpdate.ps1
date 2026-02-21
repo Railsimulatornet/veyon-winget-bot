@@ -1,13 +1,13 @@
 <#
 Submit-VeyonWingetUpdate.ps1
 
-CI/CD:
-  - Nutzt WINGET_CREATE_GITHUB_TOKEN (kein interaktives Login).
-Lokal:
-  - Führt einmalig "wingetcreate token -s" aus und legt eine Stamp-Datei ab.
+Flow (robust):
+  1) wingetcreate update -> schreibt Manifeste lokal (kein PR)
+  2) Guard: Prüft, dass defaultLocale ReleaseNotesUrl + ReleaseDate enthält
+  3) wingetcreate submit -> erstellt PR (nur wenn Guard OK)
 
-Nutzung:
-  .\Submit-VeyonWingetUpdate.ps1 -Version 4.10.1.0
+CI/CD:
+  - Empfohlen: WINGET_CREATE_GITHUB_TOKEN als Env-Var (kein --token im Log)
 #>
 
 [CmdletBinding()]
@@ -19,9 +19,7 @@ param(
   [string]$Repo      = "veyon/veyon",
 
   [switch]$NoSubmit,
-  [switch]$ForceTokenSetup,
-
-  [string]$OutDir = (Join-Path $PWD "winget-manifests")
+  [switch]$ForceTokenSetup
 )
 
 Set-StrictMode -Version Latest
@@ -29,12 +27,12 @@ $ErrorActionPreference = "Stop"
 
 function Ensure-WingetCreateAuth {
   # CI/CD: Wenn Token als Env-Var gesetzt ist, NICHT interaktiv einloggen.
-  # (Empfohlen für CI/CD: WINGET_CREATE_GITHUB_TOKEN) :contentReference[oaicite:3]{index=3}
   if (-not $ForceTokenSetup -and $env:WINGET_CREATE_GITHUB_TOKEN -and $env:WINGET_CREATE_GITHUB_TOKEN.Trim().Length -gt 0) {
     Write-Host "CI token detected (WINGET_CREATE_GITHUB_TOKEN). Skipping 'wingetcreate token -s'."
     return
   }
 
+  # Lokal: einmalig token -s, danach Stamp-Datei.
   $stampDir  = Join-Path $env:LOCALAPPDATA "WingetCreate"
   $stampFile = Join-Path $stampDir "token_setup_done.txt"
 
@@ -46,15 +44,12 @@ function Ensure-WingetCreateAuth {
   }
 
   New-Item -ItemType Directory -Path $stampDir -Force | Out-Null
-
   Write-Host "Starte einmaliges GitHub-Login für wingetcreate (wingetcreate token -s) ..."
   & wingetcreate token -s
-  if ($LASTEXITCODE -ne 0) {
-    throw "wingetcreate token -s ist fehlgeschlagen (ExitCode $LASTEXITCODE)."
-  }
+  if ($LASTEXITCODE -ne 0) { throw "wingetcreate token -s fehlgeschlagen (ExitCode $LASTEXITCODE)." }
 
   "OK $(Get-Date -Format s)" | Out-File -FilePath $stampFile -Encoding utf8 -Force
-  Write-Host "Token-Setup abgeschlossen. Stamp-Datei geschrieben: $stampFile"
+  Write-Host "Token-Setup abgeschlossen. Stamp-Datei: $stampFile"
 }
 
 function Get-VeyonReleaseFromGitHub {
@@ -72,62 +67,91 @@ function Get-VeyonReleaseFromGitHub {
   return Invoke-RestMethod -Uri $uri -Headers $headers
 }
 
+function Find-ManifestFileByType {
+  param(
+    [Parameter(Mandatory = $true)] [string]$Root,
+    [Parameter(Mandatory = $true)] [string]$ManifestType
+  )
+
+  $files = Get-ChildItem -Path $Root -Recurse -File -Filter "*.yaml"
+  foreach ($f in $files) {
+    $txt = Get-Content -Path $f.FullName -Raw
+    if ($txt -match "(?m)^\s*ManifestType:\s*$ManifestType\s*$") { return $f.FullName }
+  }
+  return $null
+}
+
+function Assert-ReleaseMetadataPresent {
+  param(
+    [Parameter(Mandatory = $true)] [string]$DefaultLocalePath
+  )
+
+  $txt = Get-Content -Path $DefaultLocalePath -Raw
+
+  if ($txt -notmatch "(?m)^\s*ReleaseNotesUrl:\s*\S+\s*$") {
+    throw "Guard fehlgeschlagen: ReleaseNotesUrl fehlt im defaultLocale Manifest: $DefaultLocalePath"
+  }
+
+  if ($txt -notmatch "(?m)^\s*ReleaseDate:\s*\d{4}-\d{2}-\d{2}\s*$") {
+    throw "Guard fehlgeschlagen: ReleaseDate fehlt/ist ungültig (YYYY-MM-DD) im defaultLocale Manifest: $DefaultLocalePath"
+  }
+}
+
+# --- Start ---
 Ensure-WingetCreateAuth
 
-# Veyon: Version 4.10.1.0 -> Tag v4.10.1
+# Version 4.10.1.0 -> Tag v4.10.1
 $verObj = [version]$Version
 $tag3   = "v{0}.{1}.{2}" -f $verObj.Major, $verObj.Minor, $verObj.Build
 $tag4   = "v$Version"
 
-try {
-  $rel = Get-VeyonReleaseFromGitHub -Repo $Repo -Tag $tag3
-  $tagUsed = $tag3
-}
-catch {
-  $rel = Get-VeyonReleaseFromGitHub -Repo $Repo -Tag $tag4
-  $tagUsed = $tag4
-}
+try { $rel = Get-VeyonReleaseFromGitHub -Repo $Repo -Tag $tag3; $tagUsed = $tag3 }
+catch { $rel = Get-VeyonReleaseFromGitHub -Repo $Repo -Tag $tag4; $tagUsed = $tag4 }
 
-# ReleaseNotesUrl + ReleaseDate (für Manifest defaultLocale) :contentReference[oaicite:4]{index=4}
 $ReleaseNotesUrl = $rel.html_url
 $ReleaseDate     = ([DateTimeOffset]$rel.published_at).UtcDateTime.ToString("yyyy-MM-dd")
 
 $assetX86 = $rel.assets | Where-Object { $_.name -match 'win32-setup\.exe$' } | Select-Object -First 1
 $assetX64 = $rel.assets | Where-Object { $_.name -match 'win64-setup\.exe$' } | Select-Object -First 1
-
-if (-not $assetX86 -or -not $assetX64) {
-  throw "Konnte win32/win64 Setup-Assets im GitHub Release $tagUsed nicht finden."
-}
+if (-not $assetX86 -or -not $assetX64) { throw "Konnte win32/win64 Setup-Assets im GitHub Release $tagUsed nicht finden." }
 
 $UrlX86 = $assetX86.browser_download_url
 $UrlX64 = $assetX64.browser_download_url
 
-Write-Host "PackageId       : $PackageId"
-Write-Host "Version         : $Version"
-Write-Host "GitHub Tag      : $tagUsed"
-Write-Host "ReleaseDate     : $ReleaseDate"
-Write-Host "ReleaseNotesUrl : $ReleaseNotesUrl"
-Write-Host "Installer x86   : $UrlX86"
-Write-Host "Installer x64   : $UrlX64"
-
 $prTitle = "New version: $PackageId version $Version"
 
-$args = @(
-  "update", $PackageId,
-  "--version", $Version,
-  "--urls", $UrlX86, $UrlX64,
-  "--release-notes-url", $ReleaseNotesUrl,
-  "--release-date", $ReleaseDate,
-  "--prtitle", $prTitle
-)
+# 1) Erst lokal generieren (kein PR)
+$outDir = Join-Path ($env:RUNNER_TEMP ?? $env:TEMP) ("wingetcreate-" + $PackageId + "-" + $Version)
+New-Item -ItemType Directory -Path $outDir -Force | Out-Null
 
+Write-Host "Generating manifests to: $outDir"
+& wingetcreate update $PackageId `
+  --version $Version `
+  --urls $UrlX86 $UrlX64 `
+  --release-notes-url $ReleaseNotesUrl `
+  --release-date $ReleaseDate `
+  --out $outDir
+
+if ($LASTEXITCODE -ne 0) { throw "wingetcreate update (generate) fehlgeschlagen (ExitCode $LASTEXITCODE)." }
+
+# 2) Guard: Prüfen, ob defaultLocale ReleaseNotesUrl + ReleaseDate enthält
+$defaultLocale = Find-ManifestFileByType -Root $outDir -ManifestType "defaultLocale"
+if (-not $defaultLocale) { throw "Guard fehlgeschlagen: defaultLocale Manifest nicht gefunden unter $outDir" }
+
+Assert-ReleaseMetadataPresent -DefaultLocalePath $defaultLocale
+Write-Host "Guard OK: ReleaseNotesUrl + ReleaseDate vorhanden in $defaultLocale"
+
+# 3) Submit (nur wenn gewünscht)
 if ($NoSubmit) {
-  New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
-  $args += @("--out", $OutDir)
-  Write-Host "Hinweis: -NoSubmit aktiv, Manifeste werden lokal geschrieben nach: $OutDir"
-} else {
-  $args += @("--submit")
+  Write-Host "NoSubmit aktiv – kein PR wird erstellt. Manifeste liegen hier: $outDir"
+  exit 0
 }
 
-& wingetcreate @args
+$versionManifest = Find-ManifestFileByType -Root $outDir -ManifestType "version"
+if (-not $versionManifest) { throw "Submit fehlgeschlagen: version Manifest nicht gefunden unter $outDir" }
+
+Write-Host "Submitting manifest: $versionManifest"
+# Token kommt in CI/CD aus WINGET_CREATE_GITHUB_TOKEN (empfohlen), kein --token nötig.
+& wingetcreate submit --prtitle $prTitle --no-open $versionManifest
+
 exit $LASTEXITCODE
