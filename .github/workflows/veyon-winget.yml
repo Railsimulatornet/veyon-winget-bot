@@ -2,8 +2,12 @@ name: Veyon -> WinGet PR Automation
 
 on:
   workflow_dispatch:
+  # Häufiger Check -> praktisch "nahezu sofort" (max ~5–10 Minuten in der Praxis)
   schedule:
-    - cron: "17 */6 * * *" # alle 6 Stunden (UTC)
+    - cron: "2-59/5 * * * *" # alle 5 Minuten (UTC), nicht zur vollen Stunde
+  # Optional: externer Trigger (z.B. von deinem Server aus)
+  repository_dispatch:
+    types: [veyon_check_now]
 
 permissions:
   contents: read
@@ -30,13 +34,12 @@ jobs:
           $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/veyon/veyon/releases/latest" -Headers $headers
           $tag = $rel.tag_name  # z.B. v4.10.1
 
-          # Version möglichst exakt aus dem Asset-Namen ziehen (z.B. veyon-4.10.1.0-win64-setup.exe)
+          # Version exakt aus Asset-Namen ziehen (z.B. veyon-4.10.1.0-win64-setup.exe)
           $assetX64 = $rel.assets | Where-Object { $_.name -match 'win64-setup\.exe$' } | Select-Object -First 1
           $version = $null
           if ($assetX64 -and $assetX64.name -match 'veyon-(\d+\.\d+\.\d+\.\d+)-win64-setup\.exe$') {
             $version = $Matches[1]
           } else {
-            # Fallback: tag vX.Y.Z -> X.Y.Z.0
             $ver3 = $tag.TrimStart('v')
             $version = "$ver3.0"
           }
@@ -46,21 +49,8 @@ jobs:
           "notesUrl=$($rel.html_url)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "releaseDate=$(([DateTimeOffset]$rel.published_at).UtcDateTime.ToString('yyyy-MM-dd'))" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
-          # 2) Schutz: existiert bereits ein offener PR für diese Version? -> dann NICHT nochmal erstellen
-          $q = [uri]::EscapeDataString("repo:microsoft/winget-pkgs is:pr is:open VeyonSolutions.Veyon $version")
-          $searchUri = "https://api.github.com/search/issues?q=$q"
-          $search = Invoke-RestMethod -Uri $searchUri -Headers $headers
-
-          if ($search.total_count -gt 0) {
-            $existing = $search.items[0].html_url
-            "needsUpdate=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-            "existingPr=$existing" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-            Write-Host "Open PR already exists for this version: $existing"
-            exit 0
-          }
-
-          # 3) ROBUSTER Check: Raw-Datei im winget-pkgs Repo (200 = vorhanden, 404 = nicht vorhanden)
-          # Hinweis: Im Repo liegt es unter manifests/v/... (lowercase v) – und diese Datei existiert für 4.10.1.0 nachweislich. 
+          # 2) ROBUSTER Check: Raw-Datei im winget-pkgs Repo (200 = vorhanden, 404 = nicht vorhanden)
+          # manifests/v/... ist korrekt (publisher-Buchstabe lowercase)
           $rawMaster = "https://raw.githubusercontent.com/microsoft/winget-pkgs/master/manifests/v/VeyonSolutions/Veyon/$version/VeyonSolutions.Veyon.installer.yaml"
           $rawMain   = "https://raw.githubusercontent.com/microsoft/winget-pkgs/main/manifests/v/VeyonSolutions/Veyon/$version/VeyonSolutions.Veyon.installer.yaml"
 
@@ -77,7 +67,6 @@ jobs:
           }
 
           if ($code -eq 404) {
-            # Fallback: falls branch mal "main" ist
             $code2 = Test-RawUrl $rawMain
             if ($code2 -eq 200) {
               "needsUpdate=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
@@ -89,12 +78,12 @@ jobs:
               Write-Host "Not present in winget-pkgs yet: $version"
               exit 0
             }
-
             throw "Unexpected HTTP status $code2 for $rawMain – aborting to avoid PR spam."
           }
 
           throw "Unexpected HTTP status $code for $rawMaster – aborting to avoid PR spam."
 
+      # START-Mail nur, wenn wirklich ein Update nötig ist
       - name: Send START email (new version found)
         if: steps.meta.outputs.needsUpdate == 'true'
         continue-on-error: true
@@ -118,7 +107,7 @@ jobs:
         run: |
           winget install -e --id Microsoft.WingetCreate --accept-package-agreements --accept-source-agreements
 
-      - name: Run Submit-VeyonWingetUpdate.ps1 (submit PR)
+      - name: Run Submit-VeyonWingetUpdate.ps1 (generate/guard/submit PR)
         if: steps.meta.outputs.needsUpdate == 'true'
         id: submit
         shell: pwsh
@@ -135,6 +124,7 @@ jobs:
             "prUrl=$pr" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           }
 
+      # END-Mail nur, wenn wirklich ein Update-Lauf gestartet wurde
       - name: Send END email (success/fail)
         if: always() && steps.meta.outputs.needsUpdate == 'true'
         continue-on-error: true
