@@ -1,0 +1,105 @@
+name: Veyon -> WinGet PR Automation
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 */6 * * *" # alle 6 Stunden (UTC)
+
+permissions:
+  contents: read
+
+concurrency:
+  group: veyon-winget
+  cancel-in-progress: true
+
+jobs:
+  veyon-winget:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine latest Veyon release & decide if update needed
+        id: meta
+        shell: pwsh
+        run: |
+          $headers = @{ "User-Agent" = "veyon-winget-bot"; "Accept" = "application/vnd.github+json" }
+
+          # 1) Neueste Veyon Release holen
+          $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/veyon/veyon/releases/latest" -Headers $headers
+          $tag = $rel.tag_name              # z.B. v4.10.1
+          $ver3 = $tag.TrimStart('v')
+          $version = "$ver3.0"              # => 4.10.1.0 (winget-Version)
+
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "notesUrl=$($rel.html_url)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "releaseDate=$(([DateTimeOffset]$rel.published_at).UtcDateTime.ToString("yyyy-MM-dd"))" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+          # 2) Prüfen ob Version schon in winget-pkgs vorhanden ist (Manifest-Ordner existiert)
+          $path = "manifests/V/VeyonSolutions/Veyon/$version"
+          $uri  = "https://api.github.com/repos/microsoft/winget-pkgs/contents/$path?ref=master"
+          $resp = Invoke-WebRequest -Uri $uri -Headers $headers -SkipHttpErrorCheck
+
+          if ($resp.StatusCode -eq 200) {
+            "needsUpdate=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          } else {
+            "needsUpdate=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
+
+      - name: Send START email (new version found)
+        if: steps.meta.outputs.needsUpdate == 'true'
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.MAIL_SERVER }}
+          server_port: ${{ secrets.MAIL_PORT }}
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          subject: "Veyon Update gefunden: ${{ steps.meta.outputs.version }} – PR wird erstellt"
+          from: ${{ secrets.MAIL_FROM }}
+          to: ${{ secrets.MAIL_TO }}
+          body: |
+            Neue Veyon-Version gefunden: ${{ steps.meta.outputs.tag }} (winget: ${{ steps.meta.outputs.version }})
+            Release Notes: ${{ steps.meta.outputs.notesUrl }}
+            Prozess startet jetzt.
+
+      - name: Install WingetCreate
+        if: steps.meta.outputs.needsUpdate == 'true'
+        shell: pwsh
+        run: |
+          winget install -e --id Microsoft.WingetCreate --accept-package-agreements --accept-source-agreements
+
+      - name: Run Submit-VeyonWingetUpdate.ps1 (submit PR)
+        if: steps.meta.outputs.needsUpdate == 'true'
+        id: submit
+        shell: pwsh
+        env:
+          WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_CREATE_GITHUB_TOKEN }}
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP "wingetcreate.log"
+          pwsh -File .\Submit-VeyonWingetUpdate.ps1 -Version "${{ steps.meta.outputs.version }}" *>&1 | Tee-Object -FilePath $log
+
+          $pr = Select-String -Path $log -Pattern "https://github\.com/microsoft/winget-pkgs/pull/\d+" -AllMatches |
+                ForEach-Object { $_.Matches.Value } | Select-Object -First 1
+
+          if ($pr) {
+            "prUrl=$pr" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
+
+      - name: Send END email (success/fail)
+        if: always() && steps.meta.outputs.needsUpdate == 'true'
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.MAIL_SERVER }}
+          server_port: ${{ secrets.MAIL_PORT }}
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          subject: "Veyon winget Prozess fertig – Status: ${{ job.status }}"
+          from: ${{ secrets.MAIL_FROM }}
+          to: ${{ secrets.MAIL_TO }}
+          body: |
+            Status: ${{ job.status }}
+            Version: ${{ steps.meta.outputs.version }}
+            PR: ${{ steps.submit.outputs.prUrl }}
+            Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
