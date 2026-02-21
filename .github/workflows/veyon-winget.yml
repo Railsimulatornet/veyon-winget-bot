@@ -23,29 +23,65 @@ jobs:
       - name: Determine latest Veyon release & decide if update needed
         id: meta
         shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
-          $headers = @{ "User-Agent" = "veyon-winget-bot"; "Accept" = "application/vnd.github+json" }
+          $headers = @{
+            "User-Agent"    = "veyon-winget-bot"
+            "Accept"        = "application/vnd.github+json"
+            "Authorization" = "Bearer $env:GITHUB_TOKEN"
+          }
 
           # 1) Neueste Veyon Release holen
           $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/veyon/veyon/releases/latest" -Headers $headers
-          $tag = $rel.tag_name              # z.B. v4.10.1
-          $ver3 = $tag.TrimStart('v')
-          $version = "$ver3.0"              # => 4.10.1.0 (winget-Version)
+          $tag = $rel.tag_name  # z.B. v4.10.1
+
+          # Version möglichst exakt aus dem Asset-Namen ziehen (z.B. veyon-4.10.1.0-win64-setup.exe)
+          $assetX64 = $rel.assets | Where-Object { $_.name -match 'win64-setup\.exe$' } | Select-Object -First 1
+          $version = $null
+          if ($assetX64 -and $assetX64.name -match 'veyon-(\d+\.\d+\.\d+\.\d+)-win64-setup\.exe$') {
+            $version = $Matches[1]
+          } else {
+            # Fallback: tag vX.Y.Z -> X.Y.Z.0
+            $ver3 = $tag.TrimStart('v')
+            $version = "$ver3.0"
+          }
 
           "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "notesUrl=$($rel.html_url)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "releaseDate=$(([DateTimeOffset]$rel.published_at).UtcDateTime.ToString("yyyy-MM-dd"))" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "releaseDate=$(([DateTimeOffset]$rel.published_at).UtcDateTime.ToString('yyyy-MM-dd'))" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
-          # 2) Prüfen ob Version schon in winget-pkgs vorhanden ist (Manifest-Ordner existiert)
-          $path = "manifests/V/VeyonSolutions/Veyon/$version"
+          # 2) Schutz: existiert bereits ein offener PR für diese Version? -> dann NICHT nochmal erstellen
+          $q = [uri]::EscapeDataString("repo:microsoft/winget-pkgs is:pr is:open VeyonSolutions.Veyon $version")
+          $searchUri = "https://api.github.com/search/issues?q=$q"
+          $search = Invoke-RestMethod -Uri $searchUri -Headers $headers
+
+          if ($search.total_count -gt 0) {
+            $existing = $search.items[0].html_url
+            "needsUpdate=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            "existingPr=$existing" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            Write-Host "Open PR already exists for this version: $existing"
+            exit 0
+          }
+
+          # 3) Prüfen ob Version schon in winget-pkgs vorhanden ist (Manifest-Ordner existiert)
+          $path = "manifests/v/VeyonSolutions/Veyon/$version"
           $uri  = "https://api.github.com/repos/microsoft/winget-pkgs/contents/$path?ref=master"
           $resp = Invoke-WebRequest -Uri $uri -Headers $headers -SkipHttpErrorCheck
 
-          if ($resp.StatusCode -eq 200) {
-            "needsUpdate=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          } else {
-            "needsUpdate=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          switch ($resp.StatusCode) {
+            200 {
+              "needsUpdate=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+              Write-Host "Already present in winget-pkgs: $version"
+            }
+            404 {
+              "needsUpdate=true"  | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+              Write-Host "Not present in winget-pkgs yet: $version"
+            }
+            default {
+              throw "GitHub API returned $($resp.StatusCode) for $uri – aborting to avoid PR spam."
+            }
           }
 
       - name: Send START email (new version found)
