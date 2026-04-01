@@ -2,10 +2,8 @@ name: Veyon -> WinGet PR Automation
 
 on:
   workflow_dispatch:
-  # Häufiger Check -> praktisch "nahezu sofort" (max ~5–10 Minuten in der Praxis)
   schedule:
-  - cron: "*/5 * * * *"
-  # Optional: externer Trigger (z.B. von deinem Server aus)
+    - cron: "*/5 * * * *"
   repository_dispatch:
     types: [veyon_check_now]
 
@@ -28,62 +26,245 @@ jobs:
         id: meta
         shell: pwsh
         run: |
-          $headers = @{ "User-Agent" = "veyon-winget-bot"; "Accept" = "application/vnd.github+json" }
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
 
-          # 1) Neueste Veyon Release holen
-          $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/veyon/veyon/releases/latest" -Headers $headers
-          $tag = $rel.tag_name  # z.B. v4.10.1
-
-          # Version exakt aus Asset-Namen ziehen (z.B. veyon-4.10.1.0-win64-setup.exe)
-          $assetX64 = $rel.assets | Where-Object { $_.name -match 'win64-setup\.exe$' } | Select-Object -First 1
-          $version = $null
-          if ($assetX64 -and $assetX64.name -match 'veyon-(\d+\.\d+\.\d+\.\d+)-win64-setup\.exe$') {
-            $version = $Matches[1]
-          } else {
-            $ver3 = $tag.TrimStart('v')
-            $version = "$ver3.0"
+          $headers = @{
+            "User-Agent" = "veyon-winget-bot"
+            "Accept"     = "application/vnd.github+json"
           }
 
-          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "notesUrl=$($rel.html_url)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "releaseDate=$(([DateTimeOffset]$rel.published_at).UtcDateTime.ToString('yyyy-MM-dd'))" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          function Set-ActionOutput {
+            param(
+              [Parameter(Mandatory = $true)][string]$Name,
+              [Parameter(Mandatory = $true)][string]$Value
+            )
 
-          # 2) ROBUSTER Check: Raw-Datei im winget-pkgs Repo (200 = vorhanden, 404 = nicht vorhanden)
-          # manifests/v/... ist korrekt (publisher-Buchstabe lowercase)
-          $rawMaster = "https://raw.githubusercontent.com/microsoft/winget-pkgs/master/manifests/v/VeyonSolutions/Veyon/$version/VeyonSolutions.Veyon.installer.yaml"
-          $rawMain   = "https://raw.githubusercontent.com/microsoft/winget-pkgs/main/manifests/v/VeyonSolutions/Veyon/$version/VeyonSolutions.Veyon.installer.yaml"
-
-          function Test-RawUrl([string]$url) {
-            $r = Invoke-WebRequest -Uri $url -Method Head -SkipHttpErrorCheck
-            return $r.StatusCode
+            "$Name=$Value" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           }
 
-          $code = Test-RawUrl $rawMaster
+          function Convert-ToVersion {
+            param(
+              [Parameter(Mandatory = $false)]
+              [AllowNull()]
+              [string]$Text
+            )
+
+            if ([string]::IsNullOrWhiteSpace($Text)) {
+              return $null
+            }
+
+            $match = [regex]::Match($Text, '(?i)(\d+\.\d+\.\d+(?:\.\d+)?)')
+            if (-not $match.Success) {
+              return $null
+            }
+
+            try {
+              return [version]$match.Groups[1].Value
+            }
+            catch {
+              return $null
+            }
+          }
+
+          function Get-VersionTextFromTag {
+            param(
+              [Parameter(Mandatory = $true)]
+              [string]$Tag
+            )
+
+            $match = [regex]::Match($Tag, '(?i)^v?(\d+\.\d+\.\d+(?:\.\d+)?)$')
+            if ($match.Success) {
+              return $match.Groups[1].Value
+            }
+
+            return $null
+          }
+
+          function Get-Version4FromAssetName {
+            param(
+              [Parameter(Mandatory = $false)]
+              [AllowNull()]
+              [string]$AssetName
+            )
+
+            if ([string]::IsNullOrWhiteSpace($AssetName)) {
+              return $null
+            }
+
+            $match = [regex]::Match($AssetName, '(?i)veyon-(\d+\.\d+\.\d+\.\d+)-win64-setup\.exe$')
+            if ($match.Success) {
+              return $match.Groups[1].Value
+            }
+
+            return $null
+          }
+
+          function Get-VeyonReleaseInfo {
+            $officialUrls = @(
+              'https://veyon.io/de/download/',
+              'https://veyon.io/en/download/'
+            )
+
+            $preferredVersionText = $null
+            $preferredSourceUrl = $null
+
+            foreach ($url in $officialUrls) {
+              try {
+                Write-Host "Prüfe offizielle Veyon-Seite: $url"
+                $response = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 30
+                $content = $response.Content
+
+                $match = [regex]::Match(
+                  $content,
+                  '(?is)Veyon\s+(\d+\.\d+\.\d+(?:\.\d+)?)\s+(?:veröffentlicht am|released on)'
+                )
+
+                if ($match.Success) {
+                  $preferredVersionText = $match.Groups[1].Value
+                  $preferredSourceUrl = $url
+                  Write-Host "Offizielle Version erkannt: $preferredVersionText"
+                  break
+                }
+              }
+              catch {
+                Write-Warning "Offizielle Seite konnte nicht ausgewertet werden: $($_.Exception.Message)"
+              }
+            }
+
+            Write-Host "Lese GitHub Releases-Liste"
+            $releases = Invoke-RestMethod -Uri "https://api.github.com/repos/veyon/veyon/releases" -Headers $headers -TimeoutSec 30
+
+            $stableReleases = foreach ($release in $releases) {
+              if ($release.draft -or $release.prerelease) {
+                continue
+              }
+
+              $versionText = Get-VersionTextFromTag -Tag $release.tag_name
+              if ([string]::IsNullOrWhiteSpace($versionText)) {
+                continue
+              }
+
+              $versionObj = Convert-ToVersion -Text $versionText
+              if ($null -eq $versionObj) {
+                continue
+              }
+
+              [pscustomobject]@{
+                Release     = $release
+                Tag         = $release.tag_name
+                VersionText = $versionText
+                VersionObj  = $versionObj
+              }
+            }
+
+            if (-not $stableReleases) {
+              throw "Es konnten keine stabilen Veyon-Releases über GitHub ermittelt werden."
+            }
+
+            $selected = $null
+
+            if (-not [string]::IsNullOrWhiteSpace($preferredVersionText)) {
+              $preferredVersionObj = Convert-ToVersion -Text $preferredVersionText
+
+              $selected = $stableReleases |
+                Where-Object { $_.VersionObj -eq $preferredVersionObj } |
+                Sort-Object VersionObj -Descending |
+                Select-Object -First 1
+
+              if ($selected) {
+                Write-Host "Passende GitHub-Release zur offiziellen Webseite gefunden: $($selected.Tag)"
+              } else {
+                Write-Warning "Keine exakte GitHub-Release zur offiziellen Version $preferredVersionText gefunden. Fallback auf höchste stabile GitHub-Version."
+              }
+            }
+
+            if (-not $selected) {
+              $selected = $stableReleases | Sort-Object VersionObj -Descending | Select-Object -First 1
+              Write-Host "Fallback-Auswahl: $($selected.Tag)"
+            }
+
+            $assetX64 = $selected.Release.assets |
+              Where-Object { $_.name -match '(?i)win64-setup\.exe$' } |
+              Select-Object -First 1
+
+            $version4 = $null
+            if ($assetX64) {
+              $version4 = Get-Version4FromAssetName -AssetName $assetX64.name
+            }
+
+            if ([string]::IsNullOrWhiteSpace($version4)) {
+              if ($selected.VersionText -match '^\d+\.\d+\.\d+$') {
+                $version4 = "$($selected.VersionText).0"
+              } else {
+                $version4 = $selected.VersionText
+              }
+            }
+
+            return [pscustomobject]@{
+              Tag               = $selected.Tag
+              Version           = $version4
+              NotesUrl          = $selected.Release.html_url
+              ReleaseDate       = ([DateTimeOffset]$selected.Release.published_at).UtcDateTime.ToString('yyyy-MM-dd')
+              PreferredSourceUrl = $preferredSourceUrl
+              PreferredVersion   = $preferredVersionText
+            }
+          }
+
+          function Test-RawUrl {
+            param(
+              [Parameter(Mandatory = $true)]
+              [string]$Url
+            )
+
+            $response = Invoke-WebRequest -Uri $Url -Method Head -SkipHttpErrorCheck -TimeoutSec 30
+            return [int]$response.StatusCode
+          }
+
+          $releaseInfo = Get-VeyonReleaseInfo
+
+          Write-Host "Gewählte Tag-Version: $($releaseInfo.Tag)"
+          Write-Host "Gewählte WinGet-Version: $($releaseInfo.Version)"
+          Write-Host "Release Notes: $($releaseInfo.NotesUrl)"
+          if ($releaseInfo.PreferredVersion) {
+            Write-Host "Offizielle Webseite meldete: $($releaseInfo.PreferredVersion) ($($releaseInfo.PreferredSourceUrl))"
+          }
+
+          Set-ActionOutput -Name 'tag' -Value $releaseInfo.Tag
+          Set-ActionOutput -Name 'version' -Value $releaseInfo.Version
+          Set-ActionOutput -Name 'notesUrl' -Value $releaseInfo.NotesUrl
+          Set-ActionOutput -Name 'releaseDate' -Value $releaseInfo.ReleaseDate
+
+          $rawMaster = "https://raw.githubusercontent.com/microsoft/winget-pkgs/master/manifests/v/VeyonSolutions/Veyon/$($releaseInfo.Version)/VeyonSolutions.Veyon.installer.yaml"
+          $rawMain   = "https://raw.githubusercontent.com/microsoft/winget-pkgs/main/manifests/v/VeyonSolutions/Veyon/$($releaseInfo.Version)/VeyonSolutions.Veyon.installer.yaml"
+
+          $code = Test-RawUrl -Url $rawMaster
           if ($code -eq 200) {
-            "needsUpdate=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-            Write-Host "Already present in winget-pkgs (master): $version"
+            Set-ActionOutput -Name 'needsUpdate' -Value 'false'
+            Write-Host "Bereits in winget-pkgs vorhanden (master): $($releaseInfo.Version)"
             exit 0
           }
 
           if ($code -eq 404) {
-            $code2 = Test-RawUrl $rawMain
+            $code2 = Test-RawUrl -Url $rawMain
+
             if ($code2 -eq 200) {
-              "needsUpdate=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-              Write-Host "Already present in winget-pkgs (main): $version"
+              Set-ActionOutput -Name 'needsUpdate' -Value 'false'
+              Write-Host "Bereits in winget-pkgs vorhanden (main): $($releaseInfo.Version)"
               exit 0
             }
+
             if ($code2 -eq 404) {
-              "needsUpdate=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-              Write-Host "Not present in winget-pkgs yet: $version"
+              Set-ActionOutput -Name 'needsUpdate' -Value 'true'
+              Write-Host "Noch nicht in winget-pkgs vorhanden: $($releaseInfo.Version)"
               exit 0
             }
-            throw "Unexpected HTTP status $code2 for $rawMain – aborting to avoid PR spam."
+
+            throw "Unerwarteter HTTP-Status $code2 für $rawMain - Abbruch zur Vermeidung von PR-Spam."
           }
 
-          throw "Unexpected HTTP status $code for $rawMaster – aborting to avoid PR spam."
+          throw "Unerwarteter HTTP-Status $code für $rawMaster - Abbruch zur Vermeidung von PR-Spam."
 
-      # START-Mail nur, wenn wirklich ein Update nötig ist
       - name: Send START email (new version found)
         if: steps.meta.outputs.needsUpdate == 'true'
         continue-on-error: true
@@ -93,11 +274,12 @@ jobs:
           server_port: ${{ secrets.MAIL_PORT }}
           username: ${{ secrets.MAIL_USERNAME }}
           password: ${{ secrets.MAIL_PASSWORD }}
-          subject: "Veyon Update gefunden: ${{ steps.meta.outputs.version }} – PR wird erstellt"
+          subject: "Veyon Update gefunden: ${{ steps.meta.outputs.version }}"
           from: ${{ secrets.MAIL_FROM }}
           to: ${{ secrets.MAIL_TO }}
           body: |
-            Neue Veyon-Version gefunden: ${{ steps.meta.outputs.tag }} (winget: ${{ steps.meta.outputs.version }})
+            Neue Veyon-Version gefunden: ${{ steps.meta.outputs.tag }}
+            WinGet-Version: ${{ steps.meta.outputs.version }}
             Release Notes: ${{ steps.meta.outputs.notesUrl }}
             Prozess startet jetzt.
 
@@ -121,10 +303,9 @@ jobs:
                 ForEach-Object { $_.Matches.Value } | Select-Object -First 1
 
           if ($pr) {
-            "prUrl=$pr" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            "prUrl=$pr" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           }
 
-      # END-Mail nur, wenn wirklich ein Update-Lauf gestartet wurde
       - name: Send END email (success/fail)
         if: always() && steps.meta.outputs.needsUpdate == 'true'
         continue-on-error: true
@@ -134,7 +315,7 @@ jobs:
           server_port: ${{ secrets.MAIL_PORT }}
           username: ${{ secrets.MAIL_USERNAME }}
           password: ${{ secrets.MAIL_PASSWORD }}
-          subject: "Veyon winget Prozess fertig – Status: ${{ job.status }}"
+          subject: "Veyon winget Prozess fertig: ${{ job.status }}"
           from: ${{ secrets.MAIL_FROM }}
           to: ${{ secrets.MAIL_TO }}
           body: |
