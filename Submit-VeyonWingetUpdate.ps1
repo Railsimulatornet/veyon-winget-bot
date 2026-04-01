@@ -33,13 +33,11 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 function Ensure-WingetCreateAuth {
-    # CI/CD: Wenn Token als Env-Var gesetzt ist, NICHT interaktiv einloggen.
     if (-not $ForceTokenSetup -and $env:WINGET_CREATE_GITHUB_TOKEN -and $env:WINGET_CREATE_GITHUB_TOKEN.Trim().Length -gt 0) {
         Write-Host "CI token detected (WINGET_CREATE_GITHUB_TOKEN). Skipping 'wingetcreate token -s'."
         return
     }
 
-    # Lokal: einmalig token -s, danach Stamp-Datei.
     $stampDir = Join-Path $env:LOCALAPPDATA "WingetCreate"
     $stampFile = Join-Path $stampDir "token_setup_done.txt"
 
@@ -153,7 +151,7 @@ function Assert-ReleaseMetadataPresent {
 
 Ensure-WingetCreateAuth
 
-# Version 4.10.1.0 -> Tag v4.10.1
+# Version 4.10.2.0 -> bevorzugt Tag v4.10.2, fallback v4.10.2.0
 $verObj = [version]$Version
 $tag3 = "v{0}.{1}.{2}" -f $verObj.Major, $verObj.Minor, $verObj.Build
 $tag4 = "v$Version"
@@ -183,7 +181,9 @@ $UrlX64 = $assetX64.browser_download_url
 $prTitle = "New version: $PackageId version $Version"
 
 # 1) Erst lokal generieren (kein PR)
-$outDir = Join-Path ($env:RUNNER_TEMP ?? $env:TEMP) ("wingetcreate-" + $PackageId + "-" + $Version)
+$tempBase = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { $env:TEMP }
+$outDir = Join-Path $tempBase ("wingetcreate-" + $PackageId + "-" + $Version)
+
 New-Item -ItemType Directory -Path $outDir -Force | Out-Null
 
 Write-Host "Generating manifests to: $outDir"
@@ -215,7 +215,7 @@ Assert-ReleaseMetadataPresent -DefaultLocalePath $defaultLocale -InstallerPath $
 Write-Host "Guard OK: ReleaseNotesUrl vorhanden in $defaultLocale"
 Write-Host "Guard OK: ReleaseDate vorhanden in $installerManifest oder fallback im defaultLocale"
 
-# 3) Submit (nur wenn gewünscht)
+# 3) Submit
 if ($NoSubmit) {
     Write-Host "NoSubmit aktiv - kein PR wird erstellt. Manifeste liegen hier: $outDir"
     exit 0
@@ -226,8 +226,22 @@ if (-not $versionManifest) {
     throw "Submit fehlgeschlagen: version Manifest nicht gefunden unter $outDir"
 }
 
-Write-Host "Submitting manifest: $versionManifest"
+# WICHTIG:
+# Für Multi-File-Manifeste nicht die einzelne *.yaml submitten,
+# sondern den Versionsordner mit allen Manifestdateien.
+$manifestDir = Split-Path -Parent $versionManifest
 
-# Token kommt in CI/CD aus WINGET_CREATE_GITHUB_TOKEN (empfohlen), kein --token nötig.
-& wingetcreate submit --prtitle $prTitle --no-open $versionManifest
-exit $LASTEXITCODE
+if (-not (Test-Path -Path $manifestDir -PathType Container)) {
+    throw "Submit fehlgeschlagen: Manifest-Verzeichnis nicht gefunden: $manifestDir"
+}
+
+Write-Host "Submitting manifest directory: $manifestDir"
+
+# Kein abschließender Backslash anhängen.
+& wingetcreate submit --prtitle $prTitle --no-open $manifestDir
+
+if ($LASTEXITCODE -ne 0) {
+    throw "wingetcreate submit fehlgeschlagen (ExitCode $LASTEXITCODE)."
+}
+
+exit 0
