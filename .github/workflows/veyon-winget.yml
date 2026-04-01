@@ -39,7 +39,6 @@ jobs:
               [Parameter(Mandatory = $true)][string]$Name,
               [Parameter(Mandatory = $true)][string]$Value
             )
-
             "$Name=$Value" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           }
 
@@ -202,10 +201,10 @@ jobs:
             }
 
             return [pscustomobject]@{
-              Tag               = $selected.Tag
-              Version           = $version4
-              NotesUrl          = $selected.Release.html_url
-              ReleaseDate       = ([DateTimeOffset]$selected.Release.published_at).UtcDateTime.ToString('yyyy-MM-dd')
+              Tag                = $selected.Tag
+              Version            = $version4
+              NotesUrl           = $selected.Release.html_url
+              ReleaseDate        = ([DateTimeOffset]$selected.Release.published_at).UtcDateTime.ToString('yyyy-MM-dd')
               PreferredSourceUrl = $preferredSourceUrl
               PreferredVersion   = $preferredVersionText
             }
@@ -221,6 +220,30 @@ jobs:
             return [int]$response.StatusCode
           }
 
+          function Find-ExistingOpenPr {
+            param(
+              [Parameter(Mandatory = $true)]
+              [string]$PackageId,
+
+              [Parameter(Mandatory = $true)]
+              [string]$Version
+            )
+
+            $query = 'repo:microsoft/winget-pkgs is:pr is:open in:title "New version: ' + $PackageId + ' version ' + $Version + '"'
+            $encodedQuery = [uri]::EscapeDataString($query)
+            $uri = "https://api.github.com/search/issues?q=$encodedQuery&per_page=10"
+
+            Write-Host "Suche nach bestehender offener PR: $query"
+            $result = Invoke-RestMethod -Uri $uri -Headers $headers -TimeoutSec 30
+
+            if ($result.total_count -gt 0) {
+              return $result.items | Select-Object -First 1
+            }
+
+            return $null
+          }
+
+          $packageId = 'VeyonSolutions.Veyon'
           $releaseInfo = Get-VeyonReleaseInfo
 
           Write-Host "Gewählte Tag-Version: $($releaseInfo.Tag)"
@@ -235,6 +258,16 @@ jobs:
           Set-ActionOutput -Name 'notesUrl' -Value $releaseInfo.NotesUrl
           Set-ActionOutput -Name 'releaseDate' -Value $releaseInfo.ReleaseDate
 
+          # 0) Zuerst prüfen, ob bereits eine offene PR existiert
+          $existingPr = Find-ExistingOpenPr -PackageId $packageId -Version $releaseInfo.Version
+          if ($existingPr) {
+            Set-ActionOutput -Name 'needsUpdate' -Value 'false'
+            Set-ActionOutput -Name 'existingPrUrl' -Value $existingPr.html_url
+            Write-Host "Es existiert bereits eine offene PR: $($existingPr.html_url)"
+            exit 0
+          }
+
+          # 1) Danach wie bisher prüfen, ob die Version schon im Repo gemerged ist
           $rawMaster = "https://raw.githubusercontent.com/microsoft/winget-pkgs/master/manifests/v/VeyonSolutions/Veyon/$($releaseInfo.Version)/VeyonSolutions.Veyon.installer.yaml"
           $rawMain   = "https://raw.githubusercontent.com/microsoft/winget-pkgs/main/manifests/v/VeyonSolutions/Veyon/$($releaseInfo.Version)/VeyonSolutions.Veyon.installer.yaml"
 
@@ -256,7 +289,7 @@ jobs:
 
             if ($code2 -eq 404) {
               Set-ActionOutput -Name 'needsUpdate' -Value 'true'
-              Write-Host "Noch nicht in winget-pkgs vorhanden: $($releaseInfo.Version)"
+              Write-Host "Noch nicht in winget-pkgs vorhanden und keine offene PR gefunden: $($releaseInfo.Version)"
               exit 0
             }
 
@@ -283,6 +316,12 @@ jobs:
             Release Notes: ${{ steps.meta.outputs.notesUrl }}
             Prozess startet jetzt.
 
+      - name: Info: Open PR already exists
+        if: steps.meta.outputs.needsUpdate != 'true' && steps.meta.outputs.existingPrUrl != ''
+        shell: pwsh
+        run: |
+          Write-Host "Keine neue PR nötig. Bereits offen: ${{ steps.meta.outputs.existingPrUrl }}"
+
       - name: Install WingetCreate
         if: steps.meta.outputs.needsUpdate == 'true'
         shell: pwsh
@@ -307,7 +346,7 @@ jobs:
           }
 
       - name: Send END email (success/fail)
-        if: always() && steps.meta.outputs.needsUpdate == 'true'
+        if: always()
         continue-on-error: true
         uses: dawidd6/action-send-mail@v3
         with:
@@ -321,5 +360,6 @@ jobs:
           body: |
             Status: ${{ job.status }}
             Version: ${{ steps.meta.outputs.version }}
-            PR: ${{ steps.submit.outputs.prUrl }}
+            Neue PR: ${{ steps.submit.outputs.prUrl }}
+            Bereits offene PR: ${{ steps.meta.outputs.existingPrUrl }}
             Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
