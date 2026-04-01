@@ -2,118 +2,180 @@
 Submit-VeyonWingetUpdate.ps1
 
 Flow (robust):
-  1) wingetcreate update -> schreibt Manifeste lokal (kein PR)
-  2) Guard: Prüft, dass defaultLocale ReleaseNotesUrl + ReleaseDate enthält
-  3) wingetcreate submit -> erstellt PR (nur wenn Guard OK)
+
+ 1) wingetcreate update -> schreibt Manifeste lokal (kein PR)
+
+ 2) Guard:
+    - defaultLocale muss ReleaseNotesUrl enthalten
+    - installer muss ReleaseDate enthalten
+    - fallback-kompatibel: ReleaseDate wird auch im defaultLocale akzeptiert,
+      falls sich das Toolverhalten künftig ändern sollte
+
+ 3) wingetcreate submit -> erstellt PR (nur wenn Guard OK)
 
 CI/CD:
-  - Empfohlen: WINGET_CREATE_GITHUB_TOKEN als Env-Var (kein --token im Log)
+
+ - Empfohlen: WINGET_CREATE_GITHUB_TOKEN als Env-Var (kein --token im Log)
 #>
 
 [CmdletBinding()]
 param(
-  [Parameter(Mandatory = $true)]
-  [string]$Version,
+    [Parameter(Mandatory = $true)]
+    [string]$Version,
 
-  [string]$PackageId = "VeyonSolutions.Veyon",
-  [string]$Repo      = "veyon/veyon",
-
-  [switch]$NoSubmit,
-  [switch]$ForceTokenSetup
+    [string]$PackageId = "VeyonSolutions.Veyon",
+    [string]$Repo = "veyon/veyon",
+    [switch]$NoSubmit,
+    [switch]$ForceTokenSetup
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 function Ensure-WingetCreateAuth {
-  # CI/CD: Wenn Token als Env-Var gesetzt ist, NICHT interaktiv einloggen.
-  if (-not $ForceTokenSetup -and $env:WINGET_CREATE_GITHUB_TOKEN -and $env:WINGET_CREATE_GITHUB_TOKEN.Trim().Length -gt 0) {
-    Write-Host "CI token detected (WINGET_CREATE_GITHUB_TOKEN). Skipping 'wingetcreate token -s'."
-    return
-  }
+    # CI/CD: Wenn Token als Env-Var gesetzt ist, NICHT interaktiv einloggen.
+    if (-not $ForceTokenSetup -and $env:WINGET_CREATE_GITHUB_TOKEN -and $env:WINGET_CREATE_GITHUB_TOKEN.Trim().Length -gt 0) {
+        Write-Host "CI token detected (WINGET_CREATE_GITHUB_TOKEN). Skipping 'wingetcreate token -s'."
+        return
+    }
 
-  # Lokal: einmalig token -s, danach Stamp-Datei.
-  $stampDir  = Join-Path $env:LOCALAPPDATA "WingetCreate"
-  $stampFile = Join-Path $stampDir "token_setup_done.txt"
+    # Lokal: einmalig token -s, danach Stamp-Datei.
+    $stampDir = Join-Path $env:LOCALAPPDATA "WingetCreate"
+    $stampFile = Join-Path $stampDir "token_setup_done.txt"
 
-  if ($ForceTokenSetup) {
-    Write-Host "ForceTokenSetup aktiv: führe 'wingetcreate token -s' aus ..."
-  } elseif (Test-Path -Path $stampFile -PathType Leaf) {
-    Write-Host "Token-Setup bereits durchgeführt (Stamp-Datei vorhanden): $stampFile"
-    return
-  }
+    if ($ForceTokenSetup) {
+        Write-Host "ForceTokenSetup aktiv: führe 'wingetcreate token -s' aus ..."
+    }
+    elseif (Test-Path -Path $stampFile -PathType Leaf) {
+        Write-Host "Token-Setup bereits durchgeführt (Stamp-Datei vorhanden): $stampFile"
+        return
+    }
 
-  New-Item -ItemType Directory -Path $stampDir -Force | Out-Null
-  Write-Host "Starte einmaliges GitHub-Login für wingetcreate (wingetcreate token -s) ..."
-  & wingetcreate token -s
-  if ($LASTEXITCODE -ne 0) { throw "wingetcreate token -s fehlgeschlagen (ExitCode $LASTEXITCODE)." }
+    New-Item -ItemType Directory -Path $stampDir -Force | Out-Null
 
-  "OK $(Get-Date -Format s)" | Out-File -FilePath $stampFile -Encoding utf8 -Force
-  Write-Host "Token-Setup abgeschlossen. Stamp-Datei: $stampFile"
+    Write-Host "Starte einmaliges GitHub-Login für wingetcreate (wingetcreate token -s) ..."
+    & wingetcreate token -s
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "wingetcreate token -s fehlgeschlagen (ExitCode $LASTEXITCODE)."
+    }
+
+    "OK $(Get-Date -Format s)" | Out-File -FilePath $stampFile -Encoding utf8 -Force
+    Write-Host "Token-Setup abgeschlossen. Stamp-Datei: $stampFile"
 }
 
 function Get-VeyonReleaseFromGitHub {
-  param(
-    [Parameter(Mandatory = $true)] [string]$Repo,
-    [Parameter(Mandatory = $true)] [string]$Tag
-  )
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Repo,
 
-  $headers = @{
-    "User-Agent" = "wingetcreate-veyon-update"
-    "Accept"     = "application/vnd.github+json"
-  }
+        [Parameter(Mandatory = $true)]
+        [string]$Tag
+    )
 
-  $uri = "https://api.github.com/repos/$Repo/releases/tags/$Tag"
-  return Invoke-RestMethod -Uri $uri -Headers $headers
+    $headers = @{
+        "User-Agent" = "wingetcreate-veyon-update"
+        "Accept"     = "application/vnd.github+json"
+    }
+
+    $uri = "https://api.github.com/repos/$Repo/releases/tags/$Tag"
+    return Invoke-RestMethod -Uri $uri -Headers $headers
 }
 
 function Find-ManifestFileByType {
-  param(
-    [Parameter(Mandatory = $true)] [string]$Root,
-    [Parameter(Mandatory = $true)] [string]$ManifestType
-  )
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Root,
 
-  $files = Get-ChildItem -Path $Root -Recurse -File -Filter "*.yaml"
-  foreach ($f in $files) {
-    $txt = Get-Content -Path $f.FullName -Raw
-    if ($txt -match "(?m)^\s*ManifestType:\s*$ManifestType\s*$") { return $f.FullName }
-  }
-  return $null
+        [Parameter(Mandatory = $true)]
+        [string]$ManifestType
+    )
+
+    $files = Get-ChildItem -Path $Root -Recurse -File -Filter "*.yaml"
+    foreach ($f in $files) {
+        $txt = Get-Content -Path $f.FullName -Raw
+        if ($txt -match "(?m)^\s*ManifestType:\s*$ManifestType\s*$") {
+            return $f.FullName
+        }
+    }
+
+    return $null
+}
+
+function Test-ManifestField {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Regex
+    )
+
+    if (-not (Test-Path -Path $Path -PathType Leaf)) {
+        return $false
+    }
+
+    $txt = Get-Content -Path $Path -Raw
+    return ($txt -match $Regex)
 }
 
 function Assert-ReleaseMetadataPresent {
-  param(
-    [Parameter(Mandatory = $true)] [string]$DefaultLocalePath
-  )
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DefaultLocalePath,
 
-  $txt = Get-Content -Path $DefaultLocalePath -Raw
+        [Parameter(Mandatory = $true)]
+        [string]$InstallerPath
+    )
 
-  if ($txt -notmatch "(?m)^\s*ReleaseNotesUrl:\s*\S+\s*$") {
-    throw "Guard fehlgeschlagen: ReleaseNotesUrl fehlt im defaultLocale Manifest: $DefaultLocalePath"
-  }
+    $hasReleaseNotesUrl = Test-ManifestField `
+        -Path $DefaultLocalePath `
+        -Regex "(?m)^\s*ReleaseNotesUrl:\s*\S+\s*$"
 
-  if ($txt -notmatch "(?m)^\s*ReleaseDate:\s*\d{4}-\d{2}-\d{2}\s*$") {
-    throw "Guard fehlgeschlagen: ReleaseDate fehlt/ist ungültig (YYYY-MM-DD) im defaultLocale Manifest: $DefaultLocalePath"
-  }
+    if (-not $hasReleaseNotesUrl) {
+        throw "Guard fehlgeschlagen: ReleaseNotesUrl fehlt im defaultLocale Manifest: $DefaultLocalePath"
+    }
+
+    $hasReleaseDateInInstaller = Test-ManifestField `
+        -Path $InstallerPath `
+        -Regex "(?m)^\s*ReleaseDate:\s*\d{4}-\d{2}-\d{2}\s*$"
+
+    $hasReleaseDateInDefaultLocale = Test-ManifestField `
+        -Path $DefaultLocalePath `
+        -Regex "(?m)^\s*ReleaseDate:\s*\d{4}-\d{2}-\d{2}\s*$"
+
+    if (-not $hasReleaseDateInInstaller -and -not $hasReleaseDateInDefaultLocale) {
+        throw "Guard fehlgeschlagen: ReleaseDate fehlt/ist ungültig (YYYY-MM-DD). Weder im installer Manifest noch im defaultLocale Manifest gefunden. Installer: $InstallerPath | defaultLocale: $DefaultLocalePath"
+    }
 }
 
 # --- Start ---
+
 Ensure-WingetCreateAuth
 
 # Version 4.10.1.0 -> Tag v4.10.1
 $verObj = [version]$Version
-$tag3   = "v{0}.{1}.{2}" -f $verObj.Major, $verObj.Minor, $verObj.Build
-$tag4   = "v$Version"
+$tag3 = "v{0}.{1}.{2}" -f $verObj.Major, $verObj.Minor, $verObj.Build
+$tag4 = "v$Version"
 
-try { $rel = Get-VeyonReleaseFromGitHub -Repo $Repo -Tag $tag3; $tagUsed = $tag3 }
-catch { $rel = Get-VeyonReleaseFromGitHub -Repo $Repo -Tag $tag4; $tagUsed = $tag4 }
+try {
+    $rel = Get-VeyonReleaseFromGitHub -Repo $Repo -Tag $tag3
+    $tagUsed = $tag3
+}
+catch {
+    $rel = Get-VeyonReleaseFromGitHub -Repo $Repo -Tag $tag4
+    $tagUsed = $tag4
+}
 
 $ReleaseNotesUrl = $rel.html_url
-$ReleaseDate     = ([DateTimeOffset]$rel.published_at).UtcDateTime.ToString("yyyy-MM-dd")
+$ReleaseDate = ([DateTimeOffset]$rel.published_at).UtcDateTime.ToString("yyyy-MM-dd")
 
 $assetX86 = $rel.assets | Where-Object { $_.name -match 'win32-setup\.exe$' } | Select-Object -First 1
 $assetX64 = $rel.assets | Where-Object { $_.name -match 'win64-setup\.exe$' } | Select-Object -First 1
-if (-not $assetX86 -or -not $assetX64) { throw "Konnte win32/win64 Setup-Assets im GitHub Release $tagUsed nicht finden." }
+
+if (-not $assetX86 -or -not $assetX64) {
+    throw "Konnte win32/win64 Setup-Assets im GitHub Release $tagUsed nicht finden."
+}
 
 $UrlX86 = $assetX86.browser_download_url
 $UrlX64 = $assetX64.browser_download_url
@@ -125,33 +187,47 @@ $outDir = Join-Path ($env:RUNNER_TEMP ?? $env:TEMP) ("wingetcreate-" + $PackageI
 New-Item -ItemType Directory -Path $outDir -Force | Out-Null
 
 Write-Host "Generating manifests to: $outDir"
+
 & wingetcreate update $PackageId `
-  --version $Version `
-  --urls $UrlX86 $UrlX64 `
-  --release-notes-url $ReleaseNotesUrl `
-  --release-date $ReleaseDate `
-  --out $outDir
+    --version $Version `
+    --urls $UrlX86 $UrlX64 `
+    --release-notes-url $ReleaseNotesUrl `
+    --release-date $ReleaseDate `
+    --out $outDir
 
-if ($LASTEXITCODE -ne 0) { throw "wingetcreate update (generate) fehlgeschlagen (ExitCode $LASTEXITCODE)." }
+if ($LASTEXITCODE -ne 0) {
+    throw "wingetcreate update (generate) fehlgeschlagen (ExitCode $LASTEXITCODE)."
+}
 
-# 2) Guard: Prüfen, ob defaultLocale ReleaseNotesUrl + ReleaseDate enthält
+# 2) Guard
 $defaultLocale = Find-ManifestFileByType -Root $outDir -ManifestType "defaultLocale"
-if (-not $defaultLocale) { throw "Guard fehlgeschlagen: defaultLocale Manifest nicht gefunden unter $outDir" }
+if (-not $defaultLocale) {
+    throw "Guard fehlgeschlagen: defaultLocale Manifest nicht gefunden unter $outDir"
+}
 
-Assert-ReleaseMetadataPresent -DefaultLocalePath $defaultLocale
-Write-Host "Guard OK: ReleaseNotesUrl + ReleaseDate vorhanden in $defaultLocale"
+$installerManifest = Find-ManifestFileByType -Root $outDir -ManifestType "installer"
+if (-not $installerManifest) {
+    throw "Guard fehlgeschlagen: installer Manifest nicht gefunden unter $outDir"
+}
+
+Assert-ReleaseMetadataPresent -DefaultLocalePath $defaultLocale -InstallerPath $installerManifest
+
+Write-Host "Guard OK: ReleaseNotesUrl vorhanden in $defaultLocale"
+Write-Host "Guard OK: ReleaseDate vorhanden in $installerManifest oder fallback im defaultLocale"
 
 # 3) Submit (nur wenn gewünscht)
 if ($NoSubmit) {
-  Write-Host "NoSubmit aktiv – kein PR wird erstellt. Manifeste liegen hier: $outDir"
-  exit 0
+    Write-Host "NoSubmit aktiv - kein PR wird erstellt. Manifeste liegen hier: $outDir"
+    exit 0
 }
 
 $versionManifest = Find-ManifestFileByType -Root $outDir -ManifestType "version"
-if (-not $versionManifest) { throw "Submit fehlgeschlagen: version Manifest nicht gefunden unter $outDir" }
+if (-not $versionManifest) {
+    throw "Submit fehlgeschlagen: version Manifest nicht gefunden unter $outDir"
+}
 
 Write-Host "Submitting manifest: $versionManifest"
+
 # Token kommt in CI/CD aus WINGET_CREATE_GITHUB_TOKEN (empfohlen), kein --token nötig.
 & wingetcreate submit --prtitle $prTitle --no-open $versionManifest
-
 exit $LASTEXITCODE
