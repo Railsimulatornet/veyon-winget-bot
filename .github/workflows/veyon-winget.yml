@@ -316,7 +316,7 @@ jobs:
             Release Notes: ${{ steps.meta.outputs.notesUrl }}
             Prozess startet jetzt.
 
-      - name: Info: Open PR already exists
+      - name: "Info: Open PR already exists"
         if: steps.meta.outputs.needsUpdate != 'true' && steps.meta.outputs.existingPrUrl != ''
         shell: pwsh
         run: |
