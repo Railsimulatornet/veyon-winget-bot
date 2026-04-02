@@ -346,7 +346,7 @@ jobs:
           }
 
       - name: Send END email (success/fail)
-        if: always()
+        if: ${{ failure() || steps.submit.outputs.prUrl != '' }}
         continue-on-error: true
         uses: dawidd6/action-send-mail@v3
         with:
