@@ -1,4 +1,4 @@
-<#
+﻿<#
 Submit-VeyonWingetUpdate.ps1
 
 Flow:
