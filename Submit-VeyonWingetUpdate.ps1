@@ -3,41 +3,104 @@ Submit-VeyonWingetUpdate.ps1
 
 Flow:
 
- 1) Resolve the real Veyon Windows installer version from GitHub release assets.
-    This also supports cases where Veyon publishes an intermediate Windows build
-    as an additional asset inside an older release tag, for example:
-    veyon-4.10.2.21-win64-setup.exe inside release tag v4.10.2.
+ 1) Read all stable Veyon GitHub releases.
+ 2) Detect real Windows installer versions from asset filenames:
+      veyon-4.10.2.21-win64-setup.exe
+      veyon-4.10.3.0-win32-setup.exe
+      veyon-4.10.3.0-win64-setup.exe
 
- 2) Skip safely if the effective version already exists in winget-pkgs
-    or if an open PR for that exact version already exists.
+ 3) Intermediate versions are supported, but only if the asset version belongs
+    to the release base:
+      Release v4.10.2 -> allowed: 4.10.2.0, 4.10.2.21
+      Release v4.10.3 -> allowed: 4.10.3.0, 4.10.3.x
+      Release v4.3.1  -> not allowed: 4.99.0.171
 
- 3) wingetcreate update -> writes manifests locally, no PR yet.
+ 4) Automatic PR creation requires win32 and win64 setup assets by default.
+    This avoids wingetcreate update failures caused by a different number of
+    installer URLs compared to the existing manifest.
 
- 4) Guard:
-    - defaultLocale must contain ReleaseNotesUrl
-    - installer or defaultLocale must contain ReleaseDate
-    - installer URLs must match the effective Veyon installer version
-
- 5) wingetcreate submit -> creates PR only if Guard is OK
+ 5) CheckOnly mode is used by GitHub Actions to decide whether a PR is needed.
 
 CI/CD:
 
- - Recommended: WINGET_CREATE_GITHUB_TOKEN as Env-Var
+ - Recommended: WINGET_CREATE_GITHUB_TOKEN as Env-Var.
 #>
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)]
-    [string]$Version,
+    [Parameter(Mandatory = $false)]
+    [AllowNull()]
+    [string]$Version = "",
 
     [string]$PackageId = "VeyonSolutions.Veyon",
     [string]$Repo = "veyon/veyon",
+
+    [switch]$CheckOnly,
     [switch]$NoSubmit,
-    [switch]$ForceTokenSetup
+    [switch]$ForceTokenSetup,
+    [switch]$AllowSingleArchitecture
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+
+function Write-ActionOutput {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+
+        [Parameter(Mandatory = $false)]
+        [AllowNull()]
+        [string]$Value
+    )
+
+    if ($null -eq $Value) {
+        $Value = ""
+    }
+
+    if ($env:GITHUB_OUTPUT) {
+        "$Name=$Value" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+    }
+}
+
+function Write-CheckOutputs {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$NeedsUpdate,
+
+        [Parameter(Mandatory = $false)]
+        [AllowNull()]
+        [string]$Version,
+
+        [Parameter(Mandatory = $false)]
+        [AllowNull()]
+        [string]$Tag,
+
+        [Parameter(Mandatory = $false)]
+        [AllowNull()]
+        [string]$NotesUrl,
+
+        [Parameter(Mandatory = $false)]
+        [AllowNull()]
+        [string]$ReleaseDate,
+
+        [Parameter(Mandatory = $false)]
+        [AllowNull()]
+        [string]$ExistingPrUrl,
+
+        [Parameter(Mandatory = $false)]
+        [AllowNull()]
+        [string]$Reason
+    )
+
+    Write-ActionOutput -Name "needsUpdate" -Value $NeedsUpdate
+    Write-ActionOutput -Name "version" -Value $Version
+    Write-ActionOutput -Name "tag" -Value $Tag
+    Write-ActionOutput -Name "notesUrl" -Value $NotesUrl
+    Write-ActionOutput -Name "releaseDate" -Value $ReleaseDate
+    Write-ActionOutput -Name "existingPrUrl" -Value $ExistingPrUrl
+    Write-ActionOutput -Name "reason" -Value $Reason
+}
 
 function Get-GitHubHeaders {
     $headers = @{
@@ -106,6 +169,37 @@ function Convert-ToSafeVersion {
     }
 }
 
+function Convert-ToVersionText4 {
+    param(
+        [Parameter(Mandatory = $true)]
+        [version]$VersionObject
+    )
+
+    if ($VersionObject.Build -lt 0) {
+        throw "Version muss mindestens drei Segmente enthalten: $VersionObject"
+    }
+
+    if ($VersionObject.Revision -ge 0) {
+        return "{0}.{1}.{2}.{3}" -f $VersionObject.Major, $VersionObject.Minor, $VersionObject.Build, $VersionObject.Revision
+    }
+
+    return "{0}.{1}.{2}.0" -f $VersionObject.Major, $VersionObject.Minor, $VersionObject.Build
+}
+
+function Get-VersionTextFromTag {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Tag
+    )
+
+    $match = [regex]::Match($Tag, '(?i)^v?(\d+\.\d+\.\d+(?:\.\d+)?)$')
+    if ($match.Success) {
+        return $match.Groups[1].Value
+    }
+
+    return $null
+}
+
 function Get-VersionTextFromAssetName {
     param(
         [Parameter(Mandatory = $false)]
@@ -152,18 +246,20 @@ function Get-ArchitectureFromAssetName {
     return $null
 }
 
-function Get-VeyonReleaseFromGitHub {
+function Test-AssetVersionBelongsToReleaseBase {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$Repo,
+        [version]$AssetVersion,
 
         [Parameter(Mandatory = $true)]
-        [string]$Tag
+        [version]$ReleaseTagVersion
     )
 
-    $headers = Get-GitHubHeaders
-    $uri = "https://api.github.com/repos/$Repo/releases/tags/$Tag"
-    return Invoke-RestMethod -Uri $uri -Headers $headers -TimeoutSec 30
+    return (
+        $AssetVersion.Major -eq $ReleaseTagVersion.Major -and
+        $AssetVersion.Minor -eq $ReleaseTagVersion.Minor -and
+        $AssetVersion.Build -eq $ReleaseTagVersion.Build
+    )
 }
 
 function Get-VeyonStableReleasesFromGitHub {
@@ -174,6 +270,9 @@ function Get-VeyonStableReleasesFromGitHub {
 
     $headers = Get-GitHubHeaders
     $uri = "https://api.github.com/repos/$Repo/releases?per_page=100"
+
+    Write-Host "Lese stabile Veyon GitHub Releases: $uri"
+
     $releases = Invoke-RestMethod -Uri $uri -Headers $headers -TimeoutSec 30
 
     $stableReleases = @(
@@ -182,16 +281,12 @@ function Get-VeyonStableReleasesFromGitHub {
                 continue
             }
 
-            $tagVersionMatch = [regex]::Match(
-                [string]$release.tag_name,
-                '(?i)^v?(\d+\.\d+\.\d+(?:\.\d+)?)$'
-            )
-
-            if (-not $tagVersionMatch.Success) {
+            $tagVersionText = Get-VersionTextFromTag -Tag ([string]$release.tag_name)
+            if ([string]::IsNullOrWhiteSpace($tagVersionText)) {
                 continue
             }
 
-            $tagVersionObj = Convert-ToSafeVersion -Text $tagVersionMatch.Groups[1].Value
+            $tagVersionObj = Convert-ToSafeVersion -Text $tagVersionText
             if ($null -eq $tagVersionObj) {
                 continue
             }
@@ -199,48 +294,66 @@ function Get-VeyonStableReleasesFromGitHub {
             [pscustomobject]@{
                 Release        = $release
                 Tag            = [string]$release.tag_name
-                TagVersionText = $tagVersionMatch.Groups[1].Value
+                TagVersionText = $tagVersionText
                 TagVersionObj  = $tagVersionObj
             }
         }
     )
 
+    if (-not $stableReleases -or $stableReleases.Count -eq 0) {
+        throw "Es konnten keine stabilen Veyon-Releases über GitHub ermittelt werden."
+    }
+
     return $stableReleases
 }
 
-function Get-InstallerAssetCandidatesFromRelease {
+function Get-InstallerAssetCandidates {
     param(
         [Parameter(Mandatory = $true)]
-        $Release
+        [object[]]$StableReleases
     )
 
     $items = @()
 
-    foreach ($asset in $Release.assets) {
-        $versionText = Get-VersionTextFromAssetName -AssetName ([string]$asset.name)
-        if ([string]::IsNullOrWhiteSpace($versionText)) {
-            continue
-        }
+    foreach ($entry in $StableReleases) {
+        foreach ($asset in $entry.Release.assets) {
+            $assetName = [string]$asset.name
 
-        $versionObj = Convert-ToSafeVersion -Text $versionText
-        if ($null -eq $versionObj) {
-            continue
-        }
+            $assetVersionTextRaw = Get-VersionTextFromAssetName -AssetName $assetName
+            if ([string]::IsNullOrWhiteSpace($assetVersionTextRaw)) {
+                continue
+            }
 
-        $arch = Get-ArchitectureFromAssetName -AssetName ([string]$asset.name)
-        if ([string]::IsNullOrWhiteSpace($arch)) {
-            continue
-        }
+            $assetVersionObjRaw = Convert-ToSafeVersion -Text $assetVersionTextRaw
+            if ($null -eq $assetVersionObjRaw) {
+                continue
+            }
 
-        $items += [pscustomobject]@{
-            Release     = $Release
-            Tag         = [string]$Release.tag_name
-            VersionText = $versionText
-            VersionObj  = $versionObj
-            Arch        = $arch
-            Asset       = $asset
-            Name        = [string]$asset.name
-            Url         = [string]$asset.browser_download_url
+            if (-not (Test-AssetVersionBelongsToReleaseBase -AssetVersion $assetVersionObjRaw -ReleaseTagVersion $entry.TagVersionObj)) {
+                Write-Warning "Ignoriere unpassendes Asset '$assetName' in Release $($entry.Tag): Asset-Version passt nicht zur Release-Basis."
+                continue
+            }
+
+            $arch = Get-ArchitectureFromAssetName -AssetName $assetName
+            if ([string]::IsNullOrWhiteSpace($arch)) {
+                continue
+            }
+
+            $versionText4 = Convert-ToVersionText4 -VersionObject $assetVersionObjRaw
+            $versionObj4 = [version]$versionText4
+
+            $items += [pscustomobject]@{
+                Release         = $entry.Release
+                Tag             = $entry.Tag
+                TagVersionText  = $entry.TagVersionText
+                TagVersionObj   = $entry.TagVersionObj
+                VersionText     = $versionText4
+                VersionObj      = $versionObj4
+                Arch            = $arch
+                Asset           = $asset
+                Name            = $assetName
+                Url             = [string]$asset.browser_download_url
+            }
         }
     }
 
@@ -265,19 +378,19 @@ function New-InstallerAssetSet {
         Sort-Object Name |
         Select-Object -First 1
 
-    if (-not $assetX64) {
-        return $null
-    }
-
     $dateSources = @()
-    if ($assetX86) {
-        if ($assetX86.Asset.updated_at) { $dateSources += [DateTimeOffset]$assetX86.Asset.updated_at }
-        elseif ($assetX86.Asset.created_at) { $dateSources += [DateTimeOffset]$assetX86.Asset.created_at }
-    }
 
-    if ($assetX64) {
-        if ($assetX64.Asset.updated_at) { $dateSources += [DateTimeOffset]$assetX64.Asset.updated_at }
-        elseif ($assetX64.Asset.created_at) { $dateSources += [DateTimeOffset]$assetX64.Asset.created_at }
+    foreach ($candidate in @($assetX86, $assetX64)) {
+        if ($null -eq $candidate) {
+            continue
+        }
+
+        if ($candidate.Asset.updated_at) {
+            $dateSources += [DateTimeOffset]$candidate.Asset.updated_at
+        }
+        elseif ($candidate.Asset.created_at) {
+            $dateSources += [DateTimeOffset]$candidate.Asset.created_at
+        }
     }
 
     if ($dateSources.Count -gt 0) {
@@ -288,15 +401,51 @@ function New-InstallerAssetSet {
     }
 
     return [pscustomobject]@{
-        Tag             = $first.Tag
-        Release         = $first.Release
-        VersionText     = $first.VersionText
-        VersionObj      = $first.VersionObj
-        ReleaseNotesUrl = [string]$first.Release.html_url
-        ReleaseDate     = $releaseDate
-        AssetX86        = $assetX86
-        AssetX64        = $assetX64
+        Tag                  = $first.Tag
+        Release              = $first.Release
+        VersionText          = $first.VersionText
+        VersionObj           = $first.VersionObj
+        ReleaseNotesUrl      = [string]$first.Release.html_url
+        ReleaseDate          = $releaseDate
+        AssetX86             = $assetX86
+        AssetX64             = $assetX64
+        HasX86               = ($null -ne $assetX86)
+        HasX64               = ($null -ne $assetX64)
+        HasBothArchitectures = (($null -ne $assetX86) -and ($null -ne $assetX64))
     }
+}
+
+function Get-VeyonInstallerAssetSets {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Repo
+    )
+
+    $stableReleases = Get-VeyonStableReleasesFromGitHub -Repo $Repo
+    $candidates = Get-InstallerAssetCandidates -StableReleases $stableReleases
+
+    if (-not $candidates -or $candidates.Count -eq 0) {
+        throw "Es konnten keine gültigen Veyon Windows-Setup-Assets gefunden werden."
+    }
+
+    $sets = @(
+        $candidates |
+            Group-Object VersionText |
+            ForEach-Object {
+                New-InstallerAssetSet -CandidatesForVersion @($_.Group)
+            }
+    )
+
+    if (-not $sets -or $sets.Count -eq 0) {
+        throw "Es konnten keine gültigen Veyon Windows-Installer-Sets gebildet werden."
+    }
+
+    return @(
+        $sets |
+            Sort-Object `
+                @{ Expression = { $_.VersionObj }; Descending = $true },
+                @{ Expression = { $_.ReleaseDate }; Descending = $true }
+    )
 }
 
 function Resolve-VeyonInstallerAssetSet {
@@ -304,97 +453,74 @@ function Resolve-VeyonInstallerAssetSet {
         [Parameter(Mandatory = $true)]
         [string]$Repo,
 
-        [Parameter(Mandatory = $true)]
-        [string]$RequestedVersion
+        [Parameter(Mandatory = $false)]
+        [AllowNull()]
+        [string]$RequestedVersion,
+
+        [switch]$AllowSingleArchitecture
     )
 
-    $requestedVersionObj = Convert-ToSafeVersion -Text $RequestedVersion
-    if ($null -eq $requestedVersionObj) {
-        throw "Ungültige Version übergeben: $RequestedVersion"
+    $sets = Get-VeyonInstallerAssetSets -Repo $Repo
+    $highestDetected = $sets | Select-Object -First 1
+
+    Write-Host "Höchste erkannte Windows-Setup-Version: $($highestDetected.VersionText) aus Release $($highestDetected.Tag)"
+    Write-Host "Architekturen: win32=$($highestDetected.HasX86), win64=$($highestDetected.HasX64)"
+
+    if (-not $highestDetected.HasBothArchitectures -and -not $AllowSingleArchitecture) {
+        Write-Warning "Höchste erkannte Version $($highestDetected.VersionText) ist unvollständig. Für automatische PRs werden win32 und win64 benötigt."
     }
 
-    $verObj = [version]$RequestedVersion
-
-    $tagCandidates = New-Object System.Collections.Generic.List[string]
-
-    if ($verObj.Build -ge 0) {
-        $tagCandidates.Add(("v{0}.{1}.{2}" -f $verObj.Major, $verObj.Minor, $verObj.Build))
-    }
-
-    $tagCandidates.Add("v$RequestedVersion")
-
-    $uniqueTags = $tagCandidates | Select-Object -Unique
-
-    Write-Host "Suche passende Veyon-Release-Assets für angeforderte Version: $RequestedVersion"
-    Write-Host "Tag-Kandidaten: $($uniqueTags -join ', ')"
-
-    $directCandidates = @()
-
-    foreach ($tag in $uniqueTags) {
-        try {
-            $release = Get-VeyonReleaseFromGitHub -Repo $Repo -Tag $tag
-            $directCandidates += Get-InstallerAssetCandidatesFromRelease -Release $release
-        }
-        catch {
-            Write-Warning "GitHub Release $tag konnte nicht gelesen werden: $($_.Exception.Message)"
-        }
-    }
-
-    $directMatch = @(
-        $directCandidates |
-            Where-Object { $_.VersionObj -eq $requestedVersionObj }
-    )
-
-    if ($directMatch.Count -gt 0) {
-        $set = New-InstallerAssetSet -CandidatesForVersion $directMatch
-        if ($set) {
-            Write-Host "Passende Installer-Assets für $RequestedVersion gefunden in Release $($set.Tag)."
-            return $set
+    if (-not [string]::IsNullOrWhiteSpace($RequestedVersion)) {
+        $requestedVersionObjRaw = Convert-ToSafeVersion -Text $RequestedVersion
+        if ($null -eq $requestedVersionObjRaw) {
+            throw "Ungültige Version übergeben: $RequestedVersion"
         }
 
-        Write-Warning "Für $RequestedVersion wurden Assets gefunden, aber kein win64 Setup. Fallback auf höchste verfügbare Windows-Installer-Version."
+        $requestedVersionText4 = Convert-ToVersionText4 -VersionObject $requestedVersionObjRaw
+
+        $selectedByRequest = $sets |
+            Where-Object { $_.VersionText -eq $requestedVersionText4 } |
+            Select-Object -First 1
+
+        if (-not $selectedByRequest) {
+            throw "Angeforderte Version $requestedVersionText4 wurde nicht als gültiges Windows-Setup-Asset gefunden."
+        }
+
+        if (-not $selectedByRequest.HasX64) {
+            throw "Angeforderte Version $requestedVersionText4 hat kein win64 Setup."
+        }
+
+        if (-not $AllowSingleArchitecture -and -not $selectedByRequest.HasBothArchitectures) {
+            throw "Angeforderte Version $requestedVersionText4 ist unvollständig. Gefunden: win32=$($selectedByRequest.HasX86), win64=$($selectedByRequest.HasX64). Automatischer PR wird abgebrochen."
+        }
+
+        return [pscustomobject]@{
+            Selected        = $selectedByRequest
+            HighestDetected = $highestDetected
+        }
     }
 
-    Write-Warning "Keine direkt passende Windows-Installer-Version für $RequestedVersion gefunden. Scanne stabile Releases nach der höchsten Windows-Setup-Version."
-
-    $stableReleases = Get-VeyonStableReleasesFromGitHub -Repo $Repo
-    if (-not $stableReleases -or $stableReleases.Count -eq 0) {
-        throw "Es konnten keine stabilen Veyon-Releases über GitHub ermittelt werden."
+    $eligibleSets = if ($AllowSingleArchitecture) {
+        @($sets | Where-Object { $_.HasX64 })
+    }
+    else {
+        @($sets | Where-Object { $_.HasBothArchitectures })
     }
 
-    $allCandidates = @()
-
-    foreach ($entry in $stableReleases) {
-        $allCandidates += Get-InstallerAssetCandidatesFromRelease -Release $entry.Release
+    if (-not $eligibleSets -or $eligibleSets.Count -eq 0) {
+        throw "Es wurde keine einreichbare Veyon-Version gefunden. Erforderlich: win64 plus standardmäßig win32."
     }
 
-    if (-not $allCandidates -or $allCandidates.Count -eq 0) {
-        throw "Es konnten keine Windows-Setup-Assets in den stabilen Veyon-Releases gefunden werden."
+    $selected = $eligibleSets | Select-Object -First 1
+
+    if ($selected.VersionText -ne $highestDetected.VersionText) {
+        Write-Warning "Die höchste erkannte Version $($highestDetected.VersionText) wird nicht eingereicht. Ausgewählt wurde die höchste vollständige Version $($selected.VersionText)."
     }
 
-    $versionGroups = @(
-        $allCandidates |
-            Group-Object VersionText |
-            ForEach-Object {
-                $items = @($_.Group)
-                $set = New-InstallerAssetSet -CandidatesForVersion $items
-                if ($set) {
-                    $set
-                }
-            }
-    )
-
-    if (-not $versionGroups -or $versionGroups.Count -eq 0) {
-        throw "Es wurden Windows-Setup-Assets gefunden, aber keine Version mit win64 Setup."
+    return [pscustomobject]@{
+        Selected        = $selected
+        HighestDetected = $highestDetected
     }
-
-    $selected = $versionGroups |
-        Sort-Object VersionObj, ReleaseDate -Descending |
-        Select-Object -First 1
-
-    Write-Warning "Angeforderte Version $RequestedVersion wird nicht verwendet. Effektive Windows-Installer-Version ist $($selected.VersionText) aus Release $($selected.Tag)."
-
-    return $selected
 }
 
 function Test-RawUrl {
@@ -537,7 +663,9 @@ function Assert-InstallerUrlsMatchVersion {
         [string]$InstallerPath,
 
         [Parameter(Mandatory = $true)]
-        [string]$Version
+        [string]$Version,
+
+        [switch]$AllowSingleArchitecture
     )
 
     if (-not (Test-Path -Path $InstallerPath -PathType Leaf)) {
@@ -563,20 +691,91 @@ function Assert-InstallerUrlsMatchVersion {
         }
     }
 
+    $hasWin32 = ($installerUrls | Where-Object { $_ -match "(?i)veyon-$([regex]::Escape($Version))-win32-setup\.exe" } | Select-Object -First 1)
+    $hasWin64 = ($installerUrls | Where-Object { $_ -match "(?i)veyon-$([regex]::Escape($Version))-win64-setup\.exe" } | Select-Object -First 1)
+
+    if (-not $hasWin64) {
+        throw "Guard fehlgeschlagen: win64 InstallerUrl fehlt für Version $Version."
+    }
+
+    if (-not $AllowSingleArchitecture -and -not $hasWin32) {
+        throw "Guard fehlgeschlagen: win32 InstallerUrl fehlt für Version $Version. Automatische PRs erwarten win32 und win64."
+    }
+
     Write-Host "Guard OK: Installer URLs passen zur effektiven Version $Version"
 }
 
 # --- Start ---
 
+if ($CheckOnly) {
+    Write-Host "CheckOnly aktiv - es wird nur geprüft, ob eine neue PR nötig ist."
+
+    $resolution = Resolve-VeyonInstallerAssetSet -Repo $Repo -RequestedVersion $Version -AllowSingleArchitecture:$AllowSingleArchitecture
+    $assetSet = $resolution.Selected
+    $highestDetected = $resolution.HighestDetected
+
+    $reasonParts = @()
+
+    if ($highestDetected.VersionText -ne $assetSet.VersionText) {
+        $reasonParts += "Höchste erkannte Version $($highestDetected.VersionText) wurde nicht ausgewählt, weil sie unvollständig ist oder nicht einreichbar ist."
+    }
+
+    $reasonParts += "Ausgewählte einreichbare Version: $($assetSet.VersionText) aus Release $($assetSet.Tag)."
+
+    if (Test-WingetVersionAlreadyPresent -Version $assetSet.VersionText) {
+        $reasonParts += "Version ist bereits in winget-pkgs vorhanden."
+
+        Write-CheckOutputs `
+            -NeedsUpdate "false" `
+            -Version $assetSet.VersionText `
+            -Tag $assetSet.Tag `
+            -NotesUrl $assetSet.ReleaseNotesUrl `
+            -ReleaseDate $assetSet.ReleaseDate `
+            -ExistingPrUrl "" `
+            -Reason ($reasonParts -join " ")
+
+        exit 0
+    }
+
+    $existingPr = Find-ExistingOpenPr -PackageId $PackageId -Version $assetSet.VersionText
+    if ($existingPr) {
+        $reasonParts += "Es existiert bereits eine offene PR: $($existingPr.html_url)"
+
+        Write-CheckOutputs `
+            -NeedsUpdate "false" `
+            -Version $assetSet.VersionText `
+            -Tag $assetSet.Tag `
+            -NotesUrl $assetSet.ReleaseNotesUrl `
+            -ReleaseDate $assetSet.ReleaseDate `
+            -ExistingPrUrl $existingPr.html_url `
+            -Reason ($reasonParts -join " ")
+
+        exit 0
+    }
+
+    $reasonParts += "Version ist noch nicht in winget-pkgs vorhanden und es wurde keine offene PR gefunden."
+
+    Write-CheckOutputs `
+        -NeedsUpdate "true" `
+        -Version $assetSet.VersionText `
+        -Tag $assetSet.Tag `
+        -NotesUrl $assetSet.ReleaseNotesUrl `
+        -ReleaseDate $assetSet.ReleaseDate `
+        -ExistingPrUrl "" `
+        -Reason ($reasonParts -join " ")
+
+    exit 0
+}
+
 Ensure-WingetCreateAuth
 
-$assetSet = Resolve-VeyonInstallerAssetSet -Repo $Repo -RequestedVersion $Version
+$resolution = Resolve-VeyonInstallerAssetSet -Repo $Repo -RequestedVersion $Version -AllowSingleArchitecture:$AllowSingleArchitecture
+$assetSet = $resolution.Selected
 
 $EffectiveVersion = $assetSet.VersionText
 $ReleaseNotesUrl = $assetSet.ReleaseNotesUrl
 $ReleaseDate = $assetSet.ReleaseDate
 
-Write-Host "Angeforderte Version: $Version"
 Write-Host "Effektive WinGet-Version: $EffectiveVersion"
 Write-Host "GitHub Release Tag: $($assetSet.Tag)"
 Write-Host "Release Notes: $ReleaseNotesUrl"
@@ -589,6 +788,10 @@ if ($assetSet.AssetX86) {
     $urls += $assetSet.AssetX86.Url
 }
 else {
+    if (-not $AllowSingleArchitecture) {
+        throw "Kein win32 Setup für Version $EffectiveVersion gefunden. Automatische PRs erwarten win32 und win64."
+    }
+
     Write-Warning "Kein win32 Setup für Version $EffectiveVersion gefunden. Es wird nur win64 eingereicht."
 }
 
@@ -662,7 +865,7 @@ if (-not $installerManifest) {
 }
 
 Assert-ReleaseMetadataPresent -DefaultLocalePath $defaultLocale -InstallerPath $installerManifest
-Assert-InstallerUrlsMatchVersion -InstallerPath $installerManifest -Version $EffectiveVersion
+Assert-InstallerUrlsMatchVersion -InstallerPath $installerManifest -Version $EffectiveVersion -AllowSingleArchitecture:$AllowSingleArchitecture
 
 Write-Host "Guard OK: ReleaseNotesUrl vorhanden in $defaultLocale"
 Write-Host "Guard OK: ReleaseDate vorhanden in $installerManifest oder fallback im defaultLocale"
