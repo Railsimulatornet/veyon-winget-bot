@@ -33,7 +33,7 @@ jobs:
       - name: Send START email (new version found)
         if: steps.meta.outputs.needsUpdate == 'true'
         continue-on-error: true
-        uses: dawidd6/action-send-mail@v3
+        uses: dawidd6/action-send-mail@master
         with:
           server_address: ${{ secrets.MAIL_SERVER }}
           server_port: ${{ secrets.MAIL_PORT }}
@@ -92,7 +92,7 @@ jobs:
       - name: Send END email (success/fail)
         if: ${{ always() && steps.meta.outputs.needsUpdate == 'true' }}
         continue-on-error: true
-        uses: dawidd6/action-send-mail@v3
+        uses: dawidd6/action-send-mail@master
         with:
           server_address: ${{ secrets.MAIL_SERVER }}
           server_port: ${{ secrets.MAIL_PORT }}
