@@ -21,6 +21,10 @@ Flow:
 
  5) CheckOnly mode is used by GitHub Actions to decide whether a PR is needed.
 
+ 6) Before submitting, the script tries to sync the authenticated user's
+    microsoft/winget-pkgs fork with upstream. This prevents wingetcreate submit
+    failures caused by an outdated fork.
+
 CI/CD:
 
  - Recommended: WINGET_CREATE_GITHUB_TOKEN as Env-Var.
@@ -38,7 +42,8 @@ param(
     [switch]$CheckOnly,
     [switch]$NoSubmit,
     [switch]$ForceTokenSetup,
-    [switch]$AllowSingleArchitecture
+    [switch]$AllowSingleArchitecture,
+    [switch]$SkipForkSync
 )
 
 Set-StrictMode -Version Latest
@@ -113,6 +118,30 @@ function Get-GitHubHeaders {
     }
 
     return $headers
+}
+
+function Invoke-GitHubRest {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("Get", "Post")]
+        [string]$Method,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Uri,
+
+        [Parameter(Mandatory = $false)]
+        [AllowNull()]
+        [object]$Body = $null
+    )
+
+    $headers = Get-GitHubHeaders
+
+    if ($null -ne $Body) {
+        $jsonBody = $Body | ConvertTo-Json -Depth 20
+        return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $headers -ContentType "application/json" -Body $jsonBody -TimeoutSec 60
+    }
+
+    return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $headers -TimeoutSec 60
 }
 
 function Ensure-WingetCreateAuth {
@@ -268,12 +297,11 @@ function Get-VeyonStableReleasesFromGitHub {
         [string]$Repo
     )
 
-    $headers = Get-GitHubHeaders
     $uri = "https://api.github.com/repos/$Repo/releases?per_page=100"
 
     Write-Host "Lese stabile Veyon GitHub Releases: $uri"
 
-    $releases = Invoke-RestMethod -Uri $uri -Headers $headers -TimeoutSec 30
+    $releases = Invoke-GitHubRest -Method Get -Uri $uri
 
     $stableReleases = @(
         foreach ($release in $releases) {
@@ -574,14 +602,12 @@ function Find-ExistingOpenPr {
         [string]$Version
     )
 
-    $headers = Get-GitHubHeaders
-
     $query = 'repo:microsoft/winget-pkgs is:pr is:open in:title "New version: ' + $PackageId + ' version ' + $Version + '"'
     $encodedQuery = [uri]::EscapeDataString($query)
     $uri = "https://api.github.com/search/issues?q=$encodedQuery&per_page=10"
 
     Write-Host "Suche nach bestehender offener PR: $query"
-    $result = Invoke-RestMethod -Uri $uri -Headers $headers -TimeoutSec 30
+    $result = Invoke-GitHubRest -Method Get -Uri $uri
 
     if ($result.total_count -gt 0) {
         return $result.items | Select-Object -First 1
@@ -691,8 +717,9 @@ function Assert-InstallerUrlsMatchVersion {
         }
     }
 
-    $hasWin32 = ($installerUrls | Where-Object { $_ -match "(?i)veyon-$([regex]::Escape($Version))-win32-setup\.exe" } | Select-Object -First 1)
-    $hasWin64 = ($installerUrls | Where-Object { $_ -match "(?i)veyon-$([regex]::Escape($Version))-win64-setup\.exe" } | Select-Object -First 1)
+    $escapedVersion = [regex]::Escape($Version)
+    $hasWin32 = ($installerUrls | Where-Object { $_ -match "(?i)veyon-$escapedVersion-win32-setup\.exe" } | Select-Object -First 1)
+    $hasWin64 = ($installerUrls | Where-Object { $_ -match "(?i)veyon-$escapedVersion-win64-setup\.exe" } | Select-Object -First 1)
 
     if (-not $hasWin64) {
         throw "Guard fehlgeschlagen: win64 InstallerUrl fehlt für Version $Version."
@@ -703,6 +730,125 @@ function Assert-InstallerUrlsMatchVersion {
     }
 
     Write-Host "Guard OK: Installer URLs passen zur effektiven Version $Version"
+}
+
+function Get-AuthenticatedGitHubLogin {
+    if (-not $env:WINGET_CREATE_GITHUB_TOKEN -or $env:WINGET_CREATE_GITHUB_TOKEN.Trim().Length -eq 0) {
+        return $null
+    }
+
+    try {
+        $user = Invoke-GitHubRest -Method Get -Uri "https://api.github.com/user"
+        return [string]$user.login
+    }
+    catch {
+        Write-Warning "GitHub-Benutzer konnte über den Token nicht ermittelt werden: $($_.Exception.Message)"
+        return $null
+    }
+}
+
+function Sync-WingetPkgsFork {
+    param(
+        [switch]$Required
+    )
+
+    if ($SkipForkSync) {
+        Write-Host "Fork-Sync übersprungen, weil -SkipForkSync gesetzt ist."
+        return $false
+    }
+
+    if (-not $env:WINGET_CREATE_GITHUB_TOKEN -or $env:WINGET_CREATE_GITHUB_TOKEN.Trim().Length -eq 0) {
+        Write-Warning "Fork-Sync übersprungen: WINGET_CREATE_GITHUB_TOKEN ist nicht gesetzt."
+        return $false
+    }
+
+    $login = Get-AuthenticatedGitHubLogin
+    if ([string]::IsNullOrWhiteSpace($login)) {
+        if ($Required) {
+            throw "Fork-Sync fehlgeschlagen: GitHub-Login konnte nicht ermittelt werden."
+        }
+
+        return $false
+    }
+
+    $forkFullName = "$login/winget-pkgs"
+    Write-Host "Prüfe WinGet-Fork: $forkFullName"
+
+    try {
+        $fork = Invoke-GitHubRest -Method Get -Uri "https://api.github.com/repos/$forkFullName"
+    }
+    catch {
+        $message = $_.Exception.Message
+        Write-Warning "WinGet-Fork $forkFullName konnte nicht gelesen werden: $message"
+        Write-Warning "Falls der Fork noch nicht existiert, muss wingetcreate ihn beim ersten Submit erstellen oder du legst ihn manuell an."
+        return $false
+    }
+
+    $branch = [string]$fork.default_branch
+    if ([string]::IsNullOrWhiteSpace($branch)) {
+        $branch = "master"
+    }
+
+    Write-Host "Synchronisiere WinGet-Fork $forkFullName, Branch: $branch"
+
+    try {
+        $syncResult = Invoke-GitHubRest `
+            -Method Post `
+            -Uri "https://api.github.com/repos/$forkFullName/merge-upstream" `
+            -Body @{ branch = $branch }
+
+        if ($syncResult.message) {
+            Write-Host "Fork-Sync Ergebnis: $($syncResult.message)"
+        }
+        else {
+            Write-Host "Fork-Sync abgeschlossen."
+        }
+
+        Start-Sleep -Seconds 5
+        return $true
+    }
+    catch {
+        $message = $_.Exception.Message
+        Write-Warning "Fork-Sync über GitHub API fehlgeschlagen: $message"
+
+        if ($Required) {
+            throw "Fork-Sync fehlgeschlagen. Bitte den Fork $forkFullName manuell mit microsoft/winget-pkgs synchronisieren."
+        }
+
+        return $false
+    }
+}
+
+function Invoke-WingetCreateSubmitWithForkSync {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ManifestDir,
+
+        [Parameter(Mandatory = $true)]
+        [string]$PrTitle
+    )
+
+    Sync-WingetPkgsFork | Out-Null
+
+    Write-Host "Submitting manifest directory: $ManifestDir"
+
+    & wingetcreate submit --prtitle $PrTitle --no-open $ManifestDir
+    $submitExitCode = $LASTEXITCODE
+
+    if ($submitExitCode -eq 0) {
+        return
+    }
+
+    Write-Warning "wingetcreate submit ist fehlgeschlagen (ExitCode $submitExitCode). Versuche einmalig einen erneuten Fork-Sync und Submit-Retry."
+
+    Sync-WingetPkgsFork -Required | Out-Null
+
+    & wingetcreate submit --prtitle $PrTitle --no-open $ManifestDir
+    $submitExitCode = $LASTEXITCODE
+
+    if ($submitExitCode -ne 0) {
+        throw "wingetcreate submit fehlgeschlagen (ExitCode $submitExitCode)."
+    }
 }
 
 # --- Start ---
@@ -889,13 +1035,6 @@ if (-not (Test-Path -Path $manifestDir -PathType Container)) {
     throw "Submit fehlgeschlagen: Manifest-Verzeichnis nicht gefunden: $manifestDir"
 }
 
-Write-Host "Submitting manifest directory: $manifestDir"
-
-# Kein abschließender Backslash anhängen.
-& wingetcreate submit --prtitle $prTitle --no-open $manifestDir
-
-if ($LASTEXITCODE -ne 0) {
-    throw "wingetcreate submit fehlgeschlagen (ExitCode $LASTEXITCODE)."
-}
+Invoke-WingetCreateSubmitWithForkSync -ManifestDir $manifestDir -PrTitle $prTitle
 
 exit 0
