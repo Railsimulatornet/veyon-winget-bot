@@ -1,7 +1,10 @@
 <#
 Submit-VeyonWingetUpdate.ps1
 Compact CI script for Veyon -> WinGet.
-Detects the real Windows installer version from Veyon GitHub release assets, including intermediate builds like 4.10.2.21.
+Detects the real Windows installer version from Veyon GitHub release assets,
+including intermediate builds like 4.10.2.21.
+Also detects replaced release assets by comparing their current SHA256 digests
+with the existing WinGet installer manifest and creates a correction PR.
 #>
 
 [CmdletBinding()]
@@ -36,7 +39,9 @@ function Out-Check {
         [AllowNull()][string]$NotesUrl,
         [AllowNull()][string]$ReleaseDate,
         [AllowNull()][string]$ExistingPrUrl,
-        [AllowNull()][string]$Reason
+        [AllowNull()][string]$Reason,
+        [AllowNull()][string]$ChangeType,
+        [AllowNull()][string]$ManifestUrl
     )
     Out-Gha "needsUpdate" $NeedsUpdate
     Out-Gha "version" $Version
@@ -45,6 +50,8 @@ function Out-Check {
     Out-Gha "releaseDate" $ReleaseDate
     Out-Gha "existingPrUrl" $ExistingPrUrl
     Out-Gha "reason" $Reason
+    Out-Gha "changeType" $ChangeType
+    Out-Gha "manifestUrl" $ManifestUrl
 }
 
 function Headers {
@@ -71,6 +78,14 @@ function GH {
     return Invoke-RestMethod -Method $Method -Uri $Uri -Headers (Headers) -TimeoutSec 90
 }
 
+function Get-ObjectProperty {
+    param([AllowNull()]$Object, [string]$Name)
+    if ($null -eq $Object) { return $null }
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $null }
+    return $property.Value
+}
+
 function To-Ver {
     param([AllowNull()][string]$Text)
     if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
@@ -91,6 +106,14 @@ function TagVer {
     $m = [regex]::Match($Tag, '^v?(\d+\.\d+\.\d+(?:\.\d+)?)$', 'IgnoreCase')
     if ($m.Success) { return $m.Groups[1].Value }
     return $null
+}
+
+function Normalize-Sha256 {
+    param([AllowNull()][string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+    $m = [regex]::Match($Text.Trim(), '^(?:sha256:)?([0-9a-f]{64})$', 'IgnoreCase')
+    if (-not $m.Success) { return $null }
+    return $m.Groups[1].Value.ToUpperInvariant()
 }
 
 function AssetInfo {
@@ -153,8 +176,10 @@ function Get-AssetSets {
         $dates = @()
         foreach ($x in @($x86,$x64)) {
             if ($null -eq $x) { continue }
-            if ($x.Asset.updated_at) { $dates += [DateTimeOffset]$x.Asset.updated_at }
-            elseif ($x.Asset.created_at) { $dates += [DateTimeOffset]$x.Asset.created_at }
+            $updatedAt = Get-ObjectProperty $x.Asset "updated_at"
+            $createdAt = Get-ObjectProperty $x.Asset "created_at"
+            if ($updatedAt) { $dates += [DateTimeOffset]$updatedAt }
+            elseif ($createdAt) { $dates += [DateTimeOffset]$createdAt }
         }
         if ($dates.Count -gt 0) {
             $date = ($dates | Sort-Object UtcDateTime -Descending | Select-Object -First 1).UtcDateTime.ToString("yyyy-MM-dd")
@@ -204,26 +229,139 @@ function Resolve-Set {
     return [pscustomobject]@{ Selected=$sel; HighestDetected=$top }
 }
 
-function Head-Code {
-    param([string]$Url)
-    $r = Invoke-WebRequest -Uri $Url -Method Head -SkipHttpErrorCheck -TimeoutSec 30
-    return [int]$r.StatusCode
+function Get-AssetSha256 {
+    param($AssetInfo)
+
+    $digestRaw = Get-ObjectProperty $AssetInfo.Asset "digest"
+    $digest = Normalize-Sha256 ([string]$digestRaw)
+    if ($digest) {
+        Write-Host "SHA256 aus GitHub Release API: $($AssetInfo.Name) = $digest"
+        return $digest
+    }
+
+    Write-Warning "GitHub liefert für '$($AssetInfo.Name)' keinen SHA256-Digest. Datei wird zur Hashprüfung heruntergeladen."
+    $tempFile = Join-Path ([System.IO.Path]::GetTempPath()) ("veyon-hash-" + [guid]::NewGuid().ToString("N") + ".exe")
+    try {
+        Invoke-WebRequest -Uri $AssetInfo.Url -Headers @{ "User-Agent" = "veyon-winget-bot"; "Cache-Control" = "no-cache" } -OutFile $tempFile -TimeoutSec 300
+        $hash = (Get-FileHash -LiteralPath $tempFile -Algorithm SHA256).Hash.ToUpperInvariant()
+        Write-Host "SHA256 aus Download: $($AssetInfo.Name) = $hash"
+        return $hash
+    }
+    finally {
+        Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue
+    }
 }
 
-function In-Winget {
-    param([string]$V)
-    foreach ($branch in @("master","main")) {
-        $url = "https://raw.githubusercontent.com/microsoft/winget-pkgs/$branch/manifests/v/VeyonSolutions/Veyon/$V/VeyonSolutions.Veyon.installer.yaml"
-        $code = Head-Code $url
-        if ($code -eq 200) { Write-Host "Bereits in winget-pkgs vorhanden ($branch): $V"; return $true }
-        if ($code -ne 404) { throw "Unerwarteter HTTP-Status $code für $url" }
+function Get-CurrentAssetRecords {
+    param($Set)
+
+    $records = @()
+    foreach ($candidate in @(
+        [pscustomobject]@{ Architecture="x86"; Info=$Set.AssetX86 },
+        [pscustomobject]@{ Architecture="x64"; Info=$Set.AssetX64 }
+    )) {
+        if ($null -eq $candidate.Info) { continue }
+        $records += [pscustomobject]@{
+            Architecture = $candidate.Architecture
+            InstallerUrl = [string]$candidate.Info.Url
+            InstallerSha256 = Get-AssetSha256 $candidate.Info
+            AssetName = [string]$candidate.Info.Name
+        }
     }
-    return $false
+    return @($records)
+}
+
+function Get-WingetInstallerManifest {
+    param([string]$V)
+
+    $segments = @($PackageId -split '\.')
+    if ($segments.Count -lt 2) { throw "PackageId hat ein unerwartetes Format: $PackageId" }
+    $bucket = $PackageId.Substring(0,1).ToLowerInvariant()
+    $packagePath = $segments -join '/'
+
+    foreach ($branch in @("master","main")) {
+        $url = "https://raw.githubusercontent.com/microsoft/winget-pkgs/$branch/manifests/$bucket/$packagePath/$V/$PackageId.installer.yaml"
+        $response = Invoke-WebRequest -Uri ($url + "?t=" + [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) -Headers @{ "User-Agent" = "veyon-winget-bot"; "Cache-Control" = "no-cache" } -SkipHttpErrorCheck -TimeoutSec 60
+        $status = [int]$response.StatusCode
+        if ($status -eq 200) {
+            Write-Host "Installer-Manifest in winget-pkgs gefunden ($branch): $V"
+            return [pscustomobject]@{
+                Exists = $true
+                Branch = $branch
+                Url = $url
+                Text = [string]$response.Content
+            }
+        }
+        if ($status -ne 404) { throw "Unerwarteter HTTP-Status $status für $url" }
+    }
+
+    return [pscustomobject]@{ Exists=$false; Branch=""; Url=""; Text="" }
+}
+
+function Get-ManifestInstallerEntries {
+    param([string]$Text)
+
+    $entries = @()
+    $current = $null
+    foreach ($line in ($Text -split "`r?`n")) {
+        if ($line -match '^\s*-\s+Architecture:\s*(\S+)\s*$') {
+            if ($null -ne $current) { $entries += [pscustomobject]$current }
+            $current = [ordered]@{
+                Architecture = $matches[1]
+                InstallerUrl = ""
+                InstallerSha256 = ""
+            }
+            continue
+        }
+        if ($null -eq $current) { continue }
+        if ($line -match '^\s*InstallerUrl:\s*(\S+)\s*$') {
+            $current.InstallerUrl = $matches[1]
+            continue
+        }
+        if ($line -match '^\s*InstallerSha256:\s*([0-9A-Fa-f]{64})\s*$') {
+            $current.InstallerSha256 = $matches[1].ToUpperInvariant()
+        }
+    }
+    if ($null -ne $current) { $entries += [pscustomobject]$current }
+    return @($entries)
+}
+
+function Compare-ManifestWithAssets {
+    param(
+        [string]$ManifestText,
+        [object[]]$ExpectedAssets
+    )
+
+    $manifestEntries = @(Get-ManifestInstallerEntries $ManifestText)
+    $issues = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($expected in $ExpectedAssets) {
+        $actual = $manifestEntries | Where-Object Architecture -eq $expected.Architecture | Select-Object -First 1
+        if ($null -eq $actual) {
+            $issues.Add("Manifest-Eintrag für $($expected.Architecture) fehlt.")
+            continue
+        }
+        if (-not [string]::Equals([string]$actual.InstallerUrl, [string]$expected.InstallerUrl, [System.StringComparison]::Ordinal)) {
+            $issues.Add("InstallerUrl $($expected.Architecture) abweichend: Manifest='$($actual.InstallerUrl)', aktuell='$($expected.InstallerUrl)'.")
+        }
+        $actualHash = Normalize-Sha256 ([string]$actual.InstallerSha256)
+        if (-not $actualHash) {
+            $issues.Add("InstallerSha256 für $($expected.Architecture) fehlt oder ist ungültig.")
+        } elseif (-not [string]::Equals($actualHash, [string]$expected.InstallerSha256, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $issues.Add("SHA256 $($expected.Architecture) abweichend: Manifest=$actualHash, aktuell=$($expected.InstallerSha256).")
+        }
+    }
+
+    return [pscustomobject]@{
+        Matches = ($issues.Count -eq 0)
+        Issues = @($issues)
+        ManifestEntries = $manifestEntries
+    }
 }
 
 function Existing-Pr {
     param([string]$V)
-    $q = 'repo:microsoft/winget-pkgs is:pr is:open in:title "New version: ' + $PackageId + ' version ' + $V + '"'
+    $q = "repo:microsoft/winget-pkgs is:pr is:open in:title $PackageId $V"
     Write-Host "Suche nach bestehender offener PR: $q"
     $uri = "https://api.github.com/search/issues?q=$([uri]::EscapeDataString($q))&per_page=10"
     $r = GH Get $uri
@@ -241,7 +379,11 @@ function Find-Manifest {
 }
 
 function Guard {
-    param([string]$OutDir, [string]$V)
+    param(
+        [string]$OutDir,
+        [string]$V,
+        [object[]]$ExpectedAssets
+    )
     $locale = Find-Manifest $OutDir "defaultLocale"
     $installer = Find-Manifest $OutDir "installer"
     if (-not $locale) { throw "Guard fehlgeschlagen: defaultLocale Manifest fehlt." }
@@ -264,7 +406,13 @@ function Guard {
     if (-not ($urls | Where-Object { $_ -match "(?i)veyon-$([regex]::Escape($V))-win64-setup\.exe" })) { throw "Guard fehlgeschlagen: win64 URL fehlt." }
     if (-not $AllowSingleArchitecture -and -not ($urls | Where-Object { $_ -match "(?i)veyon-$([regex]::Escape($V))-win32-setup\.exe" })) { throw "Guard fehlgeschlagen: win32 URL fehlt." }
 
+    $comparison = Compare-ManifestWithAssets -ManifestText $itxt -ExpectedAssets $ExpectedAssets
+    if (-not $comparison.Matches) {
+        throw ("Guard fehlgeschlagen: generierte Installer-Daten stimmen nicht mit den aktuellen Release-Assets überein. " + ($comparison.Issues -join " | "))
+    }
+
     Write-Host "Guard OK: Installer URLs passen zur effektiven Version $V"
+    Write-Host "Guard OK: InstallerSha256 entspricht den aktuellen Veyon Release-Assets"
     Write-Host "Guard OK: ReleaseNotesUrl vorhanden in $locale"
     Write-Host "Guard OK: ReleaseDate vorhanden in $installer oder fallback im defaultLocale"
 }
@@ -337,27 +485,49 @@ function Submit-WithRetry {
     if ($LASTEXITCODE -ne 0) { throw "wingetcreate submit fehlgeschlagen (ExitCode $LASTEXITCODE)." }
 }
 
+function Get-BaseReason {
+    param($Resolution)
+    $set = $Resolution.Selected
+    $reason = "Ausgewählte einreichbare Version: $($set.VersionText) aus Release $($set.Tag)."
+    if ($Resolution.HighestDetected.VersionText -ne $set.VersionText) {
+        $reason = "Höchste erkannte Version $($Resolution.HighestDetected.VersionText) wurde nicht ausgewählt, weil sie unvollständig ist. $reason"
+    }
+    return $reason
+}
+
 if ($CheckOnly) {
-    Write-Host "CheckOnly aktiv - es wird nur geprüft, ob eine neue PR nötig ist."
+    Write-Host "CheckOnly aktiv - es wird geprüft, ob eine neue Version oder eine Installer-Hash-Korrektur nötig ist."
     $res = Resolve-Set
     $set = $res.Selected
-    $reason = "Ausgewählte einreichbare Version: $($set.VersionText) aus Release $($set.Tag)."
-    if ($res.HighestDetected.VersionText -ne $set.VersionText) {
-        $reason = "Höchste erkannte Version $($res.HighestDetected.VersionText) wurde nicht ausgewählt, weil sie unvollständig ist. $reason"
-    }
+    $reason = Get-BaseReason $res
+    $manifest = Get-WingetInstallerManifest $set.VersionText
 
-    if (In-Winget $set.VersionText) {
-        Out-Check "false" $set.VersionText $set.Tag $set.ReleaseNotesUrl $set.ReleaseDate "" "$reason Version ist bereits in winget-pkgs vorhanden."
+    if ($manifest.Exists) {
+        $expectedAssets = @(Get-CurrentAssetRecords $set)
+        $comparison = Compare-ManifestWithAssets -ManifestText $manifest.Text -ExpectedAssets $expectedAssets
+        if ($comparison.Matches) {
+            Out-Check "false" $set.VersionText $set.Tag $set.ReleaseNotesUrl $set.ReleaseDate "" "$reason Version und Installer-Hashes sind in winget-pkgs aktuell." "none" $manifest.Url
+            exit 0
+        }
+
+        $hashReason = "Installer-Manifest vorhanden, aber aktuelle Release-Assets weichen ab: " + ($comparison.Issues -join " | ")
+        $pr = Existing-Pr $set.VersionText
+        if ($pr) {
+            Out-Check "false" $set.VersionText $set.Tag $set.ReleaseNotesUrl $set.ReleaseDate $pr.html_url "$reason $hashReason Es existiert bereits eine offene PR: $($pr.html_url)" "installer-hash-correction" $manifest.Url
+            exit 0
+        }
+
+        Out-Check "true" $set.VersionText $set.Tag $set.ReleaseNotesUrl $set.ReleaseDate "" "$reason $hashReason Eine Korrektur-PR ist nötig." "installer-hash-correction" $manifest.Url
         exit 0
     }
 
     $pr = Existing-Pr $set.VersionText
     if ($pr) {
-        Out-Check "false" $set.VersionText $set.Tag $set.ReleaseNotesUrl $set.ReleaseDate $pr.html_url "$reason Es existiert bereits eine offene PR: $($pr.html_url)"
+        Out-Check "false" $set.VersionText $set.Tag $set.ReleaseNotesUrl $set.ReleaseDate $pr.html_url "$reason Es existiert bereits eine offene PR: $($pr.html_url)" "new-version" ""
         exit 0
     }
 
-    Out-Check "true" $set.VersionText $set.Tag $set.ReleaseNotesUrl $set.ReleaseDate "" "$reason Version ist noch nicht in winget-pkgs vorhanden und es wurde keine offene PR gefunden."
+    Out-Check "true" $set.VersionText $set.Tag $set.ReleaseNotesUrl $set.ReleaseDate "" "$reason Version ist noch nicht in winget-pkgs vorhanden und es wurde keine offene PR gefunden." "new-version" ""
     exit 0
 }
 
@@ -381,25 +551,42 @@ if ($set.AssetX86) { Write-Host "Gefundenes win32 Asset: $($set.AssetX86.Name)";
 if ($set.AssetX64) { Write-Host "Gefundenes win64 Asset: $($set.AssetX64.Name)"; $urls += $set.AssetX64.Url }
 if ($urls.Count -eq 0) { throw "Keine Installer-URLs gefunden." }
 
-if (In-Winget $v) { Write-Host "Keine PR nötig. Version $v ist bereits vorhanden."; exit 0 }
+$manifest = Get-WingetInstallerManifest $v
+$expectedAssets = @(Get-CurrentAssetRecords $set)
+$changeType = "new-version"
+$prTitle = "New version: $PackageId version $v"
+
+if ($manifest.Exists) {
+    $comparison = Compare-ManifestWithAssets -ManifestText $manifest.Text -ExpectedAssets $expectedAssets
+    if ($comparison.Matches) {
+        Write-Host "Keine PR nötig. Version $v und Installer-Hashes sind bereits aktuell."
+        exit 0
+    }
+    $changeType = "installer-hash-correction"
+    $prTitle = "Update: $PackageId version $v"
+    Write-Warning ("Korrektur derselben Version nötig: " + ($comparison.Issues -join " | "))
+}
+
 $pr = Existing-Pr $v
 if ($pr) { Write-Host "Keine PR nötig. Bereits offene PR gefunden: $($pr.html_url)"; exit 0 }
 
 $tempBase = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { $env:TEMP }
 $outDir = Join-Path $tempBase ("wingetcreate-" + $PackageId + "-" + $v)
+if (Test-Path $outDir) { Remove-Item -LiteralPath $outDir -Recurse -Force }
 New-Item -ItemType Directory -Path $outDir -Force | Out-Null
 
+Write-Host "Änderungstyp: $changeType"
 $args = @("update", $PackageId, "--version", $v, "--urls") + $urls + @("--release-notes-url", $set.ReleaseNotesUrl, "--release-date", $set.ReleaseDate, "--out", $outDir)
 & wingetcreate @args
 if ($LASTEXITCODE -ne 0) { throw "wingetcreate update fehlgeschlagen (ExitCode $LASTEXITCODE)." }
 
-Guard $outDir $v
+Guard -OutDir $outDir -V $v -ExpectedAssets $expectedAssets
 
 if ($NoSubmit) { Write-Host "NoSubmit aktiv - Manifeste liegen hier: $outDir"; exit 0 }
 
 $versionManifest = Find-Manifest $outDir "version"
 if (-not $versionManifest) { throw "Submit fehlgeschlagen: version Manifest fehlt." }
 $manifestDir = Split-Path -Parent $versionManifest
-Submit-WithRetry $manifestDir "New version: $PackageId version $v"
+Submit-WithRetry $manifestDir $prTitle
 
 exit 0
