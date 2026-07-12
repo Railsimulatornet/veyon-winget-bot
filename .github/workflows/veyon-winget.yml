@@ -22,7 +22,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Determine latest eligible Veyon installer version
+      - name: Determine required Veyon WinGet action
         id: meta
         shell: pwsh
         env:
@@ -30,7 +30,7 @@ jobs:
         run: |
           pwsh -File .\Submit-VeyonWingetUpdate.ps1 -CheckOnly
 
-      - name: Send START email (new version found)
+      - name: Send START email (new version or hash correction found)
         if: steps.meta.outputs.needsUpdate == 'true'
         continue-on-error: true
         uses: dawidd6/action-send-mail@master
@@ -39,30 +39,34 @@ jobs:
           server_port: ${{ secrets.MAIL_PORT }}
           username: ${{ secrets.MAIL_USERNAME }}
           password: ${{ secrets.MAIL_PASSWORD }}
-          subject: "Veyon Update gefunden: ${{ steps.meta.outputs.version }}"
+          subject: "Veyon WinGet-Aktion gefunden: ${{ steps.meta.outputs.version }}"
           from: ${{ secrets.MAIL_FROM }}
           to: ${{ secrets.MAIL_TO }}
           body: |
-            Neue Veyon-Version gefunden.
+            Eine Veyon-WinGet-Aktion wurde gefunden.
 
+            Änderungstyp: ${{ steps.meta.outputs.changeType }}
             WinGet-Version: ${{ steps.meta.outputs.version }}
             GitHub Release Tag: ${{ steps.meta.outputs.tag }}
             Release Notes: ${{ steps.meta.outputs.notesUrl }}
             Release Date: ${{ steps.meta.outputs.releaseDate }}
+            Bestehendes Manifest: ${{ steps.meta.outputs.manifestUrl }}
 
             Grund:
             ${{ steps.meta.outputs.reason }}
 
             Prozess startet jetzt.
 
-      - name: "Info: No update needed"
+      - name: "Info: No action needed"
         if: steps.meta.outputs.needsUpdate != 'true'
         shell: pwsh
         run: |
           Write-Host "Keine neue PR nötig."
+          Write-Host "Änderungstyp: ${{ steps.meta.outputs.changeType }}"
           Write-Host "Version: ${{ steps.meta.outputs.version }}"
           Write-Host "Grund: ${{ steps.meta.outputs.reason }}"
           Write-Host "Bestehende PR: ${{ steps.meta.outputs.existingPrUrl }}"
+          Write-Host "Manifest: ${{ steps.meta.outputs.manifestUrl }}"
 
       - name: Install WingetCreate
         if: steps.meta.outputs.needsUpdate == 'true'
@@ -70,7 +74,7 @@ jobs:
         run: |
           winget install -e --id Microsoft.WingetCreate --accept-package-agreements --accept-source-agreements
 
-      - name: Run Submit-VeyonWingetUpdate.ps1 (generate/guard/submit PR)
+      - name: Run Submit-VeyonWingetUpdate.ps1 (generate, guard, submit PR)
         if: steps.meta.outputs.needsUpdate == 'true'
         id: submit
         shell: pwsh
@@ -98,19 +102,24 @@ jobs:
           server_port: ${{ secrets.MAIL_PORT }}
           username: ${{ secrets.MAIL_USERNAME }}
           password: ${{ secrets.MAIL_PASSWORD }}
-          subject: "Veyon winget Prozess fertig: ${{ job.status }}"
+          subject: "Veyon WinGet-Prozess fertig: ${{ job.status }}"
           from: ${{ secrets.MAIL_FROM }}
           to: ${{ secrets.MAIL_TO }}
           body: |
             Status: ${{ job.status }}
 
+            Änderungstyp: ${{ steps.meta.outputs.changeType }}
             WinGet-Version: ${{ steps.meta.outputs.version }}
             GitHub Release Tag: ${{ steps.meta.outputs.tag }}
             Release Notes: ${{ steps.meta.outputs.notesUrl }}
             Release Date: ${{ steps.meta.outputs.releaseDate }}
+            Bestehendes Manifest: ${{ steps.meta.outputs.manifestUrl }}
 
             Neue PR: ${{ steps.submit.outputs.prUrl }}
             Bereits offene PR: ${{ steps.meta.outputs.existingPrUrl }}
+
+            Grund:
+            ${{ steps.meta.outputs.reason }}
 
             Run:
             https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
