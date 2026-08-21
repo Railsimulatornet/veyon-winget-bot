@@ -25,7 +25,7 @@ Hintergrund: Die Veyon-Entwickler erstellen nicht immer zeitnah einen WinGet-Pul
   - aktuelle SHA256-Hashes,
   - `ReleaseNotesUrl` und `ReleaseDate`.
 - Erkennt bereits offene PRs, damit keine Duplikate erstellt werden.
-- Synchronisiert den eigenen `winget-pkgs`-Fork vor dem Submit.
+- Synchronisiert den eigenen `winget-pkgs`-Fork unmittelbar nach der Update-Erkennung und vor der Manifest-Erzeugung. Eigene Fork-Commits werden dabei nie überschrieben.
 - Sendet E-Mail-Benachrichtigungen beim Start und Abschluss.
 
 ## Sicherheit
@@ -41,10 +41,11 @@ Standardmäßig alle **5 Minuten** per GitHub Actions Schedule (UTC).
 1. Stabile Releases und Windows-Assets ermitteln.
 2. Bestehendes WinGet-Manifest laden.
 3. Aktuelle Asset-Digests mit den Manifest-Hashes vergleichen.
-4. Bei neuer Version oder Hashabweichung Manifeste mit `wingetcreate` erzeugen.
-5. Guard ausführen.
-6. PR erstellen.
-7. End-Mail mit Status und Link zum Workflow-Run versenden.
+4. Bei nötiger Aktion den eigenen WinGet-Fork gegen `microsoft/winget-pkgs:master` synchronisieren.
+5. Bei neuer Version oder Hashabweichung Manifeste mit `wingetcreate` erzeugen.
+6. Guard ausführen.
+7. PR erstellen.
+8. End-Mail mit Status und Link zum Workflow-Run versenden.
 
 ## Benötigte Secrets (GitHub Actions)
 

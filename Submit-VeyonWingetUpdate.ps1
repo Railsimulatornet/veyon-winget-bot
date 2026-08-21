@@ -17,7 +17,7 @@ param(
     [switch]$ForceTokenSetup,
     [switch]$AllowSingleArchitecture,
     [switch]$SkipForkSync,
-    [switch]$ForceForkSync
+    [switch]$SyncForkOnly
 )
 
 Set-StrictMode -Version Latest
@@ -72,10 +72,26 @@ function GH {
         [string]$Uri,
         [AllowNull()]$Body = $null
     )
-    if ($null -ne $Body) {
-        return Invoke-RestMethod -Method $Method -Uri $Uri -Headers (Headers) -ContentType "application/json" -Body ($Body | ConvertTo-Json -Depth 20) -TimeoutSec 90
+    try {
+        if ($null -ne $Body) {
+            return Invoke-RestMethod -Method $Method -Uri $Uri -Headers (Headers) -ContentType "application/json" -Body ($Body | ConvertTo-Json -Depth 20) -TimeoutSec 90
+        }
+        return Invoke-RestMethod -Method $Method -Uri $Uri -Headers (Headers) -TimeoutSec 90
     }
-    return Invoke-RestMethod -Method $Method -Uri $Uri -Headers (Headers) -TimeoutSec 90
+    catch {
+        $status = "unbekannt"
+        $responseBody = ""
+        $response = $_.Exception.Response
+        if ($null -ne $response) {
+            try { $status = [int]$response.StatusCode } catch {}
+            try { $responseBody = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult() } catch {}
+        }
+        if ([string]::IsNullOrWhiteSpace($responseBody) -and $_.ErrorDetails -and $_.ErrorDetails.Message) {
+            $responseBody = $_.ErrorDetails.Message
+        }
+        if ([string]::IsNullOrWhiteSpace($responseBody)) { $responseBody = $_.Exception.Message }
+        throw "GitHub API $Method $Uri fehlgeschlagen (HTTP-Status: $status). Responsebody: $responseBody"
+    }
 }
 
 function Get-ObjectProperty {
@@ -417,65 +433,84 @@ function Guard {
     Write-Host "Guard OK: ReleaseDate vorhanden in $installer oder fallback im defaultLocale"
 }
 
-function Login {
-    if (-not $env:WINGET_CREATE_GITHUB_TOKEN) { return $null }
-    try { return [string](GH Get "https://api.github.com/user").login } catch { return $null }
-}
-
 function Sync-Fork {
     param([switch]$Required)
-    if ($SkipForkSync) { Write-Host "Fork-Sync übersprungen."; return $false }
-    if (-not $env:WINGET_CREATE_GITHUB_TOKEN) { Write-Warning "Fork-Sync übersprungen: Token fehlt."; return $false }
+    if ($SkipForkSync) {
+        if ($Required) { throw "Fork-Sync darf für diesen erforderlichen Schritt nicht übersprungen werden." }
+        Write-Host "Fork-Sync übersprungen."
+        return $false
+    }
+    if (-not $env:WINGET_CREATE_GITHUB_TOKEN) {
+        if ($Required) { throw "Fork-Sync fehlgeschlagen: WINGET_CREATE_GITHUB_TOKEN fehlt." }
+        Write-Warning "Fork-Sync übersprungen: Token fehlt."
+        return $false
+    }
 
-    $login = Login
-    if ([string]::IsNullOrWhiteSpace($login)) { if ($Required) { throw "Fork-Sync fehlgeschlagen: Login konnte nicht ermittelt werden." }; return $false }
-
-    $forkFull = "$login/winget-pkgs"
+    $forkFull = "Railsimulatornet/winget-pkgs"
+    $upstreamFull = "microsoft/winget-pkgs"
+    $branch = "master"
     Write-Host "Prüfe WinGet-Fork: $forkFull"
     try { $fork = GH Get "https://api.github.com/repos/$forkFull" }
     catch { if ($Required) { throw "Fork-Sync fehlgeschlagen: Fork $forkFull nicht lesbar." }; return $false }
-
-    $branch = [string]$fork.default_branch
-    if ([string]::IsNullOrWhiteSpace($branch)) { $branch = "master" }
+    if (-not $fork.fork -or [string]$fork.parent.full_name -ne $upstreamFull) {
+        throw "$forkFull ist nicht der erwartete Fork von $upstreamFull."
+    }
     Write-Host "Synchronisiere WinGet-Fork $forkFull, Branch: $branch"
 
-    try {
-        $cmp = GH Get "https://api.github.com/repos/microsoft/winget-pkgs/compare/master...$($login):$branch"
+    function Get-ForkStatus {
+        $cmp = GH Get "https://api.github.com/repos/$upstreamFull/compare/master...Railsimulatornet:$branch"
         $ahead = [int]$cmp.ahead_by
         $behind = [int]$cmp.behind_by
         Write-Host "Fork-Status: $($cmp.status), ahead_by=$ahead, behind_by=$behind"
-        if ($ahead -eq 0 -and $behind -eq 0) { Write-Host "Fork ist bereits aktuell."; return $true }
-        if ($ahead -gt 0 -and -not $ForceForkSync) {
-            throw "Fork hat eigene Commits (ahead_by=$ahead). Für Force-Sync -ForceForkSync setzen."
+        return [pscustomobject]@{ Ahead=$ahead; Behind=$behind }
+    }
+
+    function Confirm-ForkSync {
+        for ($attempt = 1; $attempt -le 3; $attempt++) {
+            $status = Get-ForkStatus
+            if ($status.Ahead -gt 0) { throw "Fork hat eigene Commits (ahead_by=$($status.Ahead)). Der Fork wird nicht überschrieben." }
+            if ($status.Behind -eq 0) {
+                Write-Host "Fork ist aktuell."
+                return
+            }
+            if ($attempt -lt 3) { Start-Sleep -Seconds 2 }
         }
-        $up = GH Get "https://api.github.com/repos/microsoft/winget-pkgs/git/ref/heads/master"
-        $sha = [string]$up.object.sha
-        Write-Host "Setze $forkFull $branch auf upstream/master: $sha"
+        throw "Fork-Sync wurde ausgeführt, aber der Fork liegt weiterhin hinter upstream (behind_by=$($status.Behind))."
+    }
+
+    $status = Get-ForkStatus
+    if ($status.Ahead -gt 0) { throw "Fork hat eigene Commits (ahead_by=$($status.Ahead)). Der Fork wird nicht überschrieben." }
+    if ($status.Behind -eq 0) { Write-Host "Fork ist bereits aktuell."; return $true }
+
+    $up = GH Get "https://api.github.com/repos/$upstreamFull/git/ref/heads/master"
+    $sha = [string]$up.object.sha
+    Write-Host "Setze $forkFull $branch auf upstream/master: $sha"
+    try {
         GH Patch "https://api.github.com/repos/$forkFull/git/refs/heads/$branch" @{ sha=$sha; force=$true } | Out-Null
-        Start-Sleep -Seconds 5
-        Write-Host "Fork-Sync per Git refs API abgeschlossen."
-        return $true
+        Write-Host "Fork-Sync per Git refs API ausgelöst."
     }
     catch {
-        Write-Warning "Fork-Sync per Git refs API fehlgeschlagen: $($_.Exception.Message)"
+        $refsError = $_.Exception.Message
+        Write-Warning "Fork-Sync per Git refs API fehlgeschlagen: $refsError"
         Write-Host "Versuche Fallback über GitHub merge-upstream API."
         try {
             GH Post "https://api.github.com/repos/$forkFull/merge-upstream" @{ branch=$branch } | Out-Null
-            Start-Sleep -Seconds 5
-            Write-Host "Fork-Sync per merge-upstream API abgeschlossen."
-            return $true
+            Write-Host "Fork-Sync per merge-upstream API ausgelöst."
         }
         catch {
-            if ($Required) { throw "Fork-Sync fehlgeschlagen. Bitte Token-Rechte prüfen oder Fork manuell synchronisieren. Details: $($_.Exception.Message)" }
+            $mergeError = $_.Exception.Message
+            if ($Required) { throw "Fork-Sync fehlgeschlagen. Bitte Token-Rechte prüfen oder Fork manuell synchronisieren. Git refs API: $refsError Merge-upstream API: $mergeError" }
             Write-Warning "Fork-Sync über merge-upstream API fehlgeschlagen: $($_.Exception.Message)"
             return $false
         }
     }
+    Confirm-ForkSync
+    return $true
 }
 
 function Submit-WithRetry {
     param([string]$ManifestDir, [string]$Title)
-    Sync-Fork | Out-Null
+    Sync-Fork -Required | Out-Null
     Write-Host "Submitting manifest directory: $ManifestDir"
     & wingetcreate submit --prtitle $Title --no-open $ManifestDir
     if ($LASTEXITCODE -eq 0) { return }
@@ -493,6 +528,11 @@ function Get-BaseReason {
         $reason = "Höchste erkannte Version $($Resolution.HighestDetected.VersionText) wurde nicht ausgewählt, weil sie unvollständig ist. $reason"
     }
     return $reason
+}
+
+if ($SyncForkOnly) {
+    Sync-Fork -Required | Out-Null
+    exit 0
 }
 
 if ($CheckOnly) {
