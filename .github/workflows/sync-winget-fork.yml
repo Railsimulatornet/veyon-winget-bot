@@ -1,0 +1,22 @@
+name: Sync WinGet Fork
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sync-winget-fork:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Synchronize WinGet fork with upstream
+        shell: pwsh
+        env:
+          WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_CREATE_GITHUB_TOKEN }}
+        run: |
+          pwsh -File .\Submit-VeyonWingetUpdate.ps1 -SyncForkOnly
