@@ -57,6 +57,14 @@ jobs:
 
             Prozess startet jetzt.
 
+      - name: Synchronize WinGet fork with upstream
+        if: steps.meta.outputs.needsUpdate == 'true'
+        shell: pwsh
+        env:
+          WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_CREATE_GITHUB_TOKEN }}
+        run: |
+          pwsh -File .\Submit-VeyonWingetUpdate.ps1 -SyncForkOnly
+
       - name: "Info: No action needed"
         if: steps.meta.outputs.needsUpdate != 'true'
         shell: pwsh
