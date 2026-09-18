@@ -450,12 +450,16 @@ function Sync-Fork {
     $upstreamFull = "microsoft/winget-pkgs"
     $branch = "master"
     Write-Host "Prüfe WinGet-Fork: $forkFull"
+
     try { $fork = GH Get "https://api.github.com/repos/$forkFull" }
-    catch { if ($Required) { throw "Fork-Sync fehlgeschlagen: Fork $forkFull nicht lesbar." }; return $false }
+    catch {
+        if ($Required) { throw "Fork-Sync fehlgeschlagen: Fork $forkFull nicht lesbar." }
+        return $false
+    }
+
     if (-not $fork.fork -or [string]$fork.parent.full_name -ne $upstreamFull) {
         throw "$forkFull ist nicht der erwartete Fork von $upstreamFull."
     }
-    Write-Host "Synchronisiere WinGet-Fork $forkFull, Branch: $branch"
 
     function Get-ForkStatus {
         $cmp = GH Get "https://api.github.com/repos/$upstreamFull/compare/master...Railsimulatornet:$branch"
@@ -465,47 +469,49 @@ function Sync-Fork {
         return [pscustomobject]@{ Ahead=$ahead; Behind=$behind }
     }
 
-    function Confirm-ForkSync {
-        for ($attempt = 1; $attempt -le 3; $attempt++) {
-            $status = Get-ForkStatus
-            if ($status.Ahead -gt 0) { throw "Fork hat eigene Commits (ahead_by=$($status.Ahead)). Der Fork wird nicht überschrieben." }
-            if ($status.Behind -eq 0) {
-                Write-Host "Fork ist aktuell."
-                return
-            }
-            if ($attempt -lt 3) { Start-Sleep -Seconds 2 }
-        }
-        throw "Fork-Sync wurde ausgeführt, aber der Fork liegt weiterhin hinter upstream (behind_by=$($status.Behind))."
+    $status = Get-ForkStatus
+    if ($status.Ahead -gt 0) {
+        throw "Fork hat eigene Commits (ahead_by=$($status.Ahead)). Der Fork wird nicht automatisch überschrieben."
+    }
+    if ($status.Behind -eq 0) {
+        Write-Host "Fork ist bereits aktuell."
+        return $true
     }
 
-    $status = Get-ForkStatus
-    if ($status.Ahead -gt 0) { throw "Fork hat eigene Commits (ahead_by=$($status.Ahead)). Der Fork wird nicht überschrieben." }
-    if ($status.Behind -eq 0) { Write-Host "Fork ist bereits aktuell."; return $true }
-
-    $up = GH Get "https://api.github.com/repos/$upstreamFull/git/ref/heads/master"
-    $sha = [string]$up.object.sha
-    Write-Host "Setze $forkFull $branch auf upstream/master: $sha"
+    Write-Host "Synchronisiere WinGet-Fork $forkFull über GitHubs merge-upstream API."
     try {
-        GH Patch "https://api.github.com/repos/$forkFull/git/refs/heads/$branch" @{ sha=$sha; force=$true } | Out-Null
-        Write-Host "Fork-Sync per Git refs API ausgelöst."
+        $sync = GH Post "https://api.github.com/repos/$forkFull/merge-upstream" @{ branch=$branch }
+        if ($sync.message) { Write-Host "Fork-Sync Ergebnis: $($sync.message)" }
     }
     catch {
-        $refsError = $_.Exception.Message
-        Write-Warning "Fork-Sync per Git refs API fehlgeschlagen: $refsError"
-        Write-Host "Versuche Fallback über GitHub merge-upstream API."
-        try {
-            GH Post "https://api.github.com/repos/$forkFull/merge-upstream" @{ branch=$branch } | Out-Null
-            Write-Host "Fork-Sync per merge-upstream API ausgelöst."
-        }
-        catch {
-            $mergeError = $_.Exception.Message
-            if ($Required) { throw "Fork-Sync fehlgeschlagen. Bitte Token-Rechte prüfen oder Fork manuell synchronisieren. Git refs API: $refsError Merge-upstream API: $mergeError" }
-            Write-Warning "Fork-Sync über merge-upstream API fehlgeschlagen: $($_.Exception.Message)"
+        $mergeError = $_.Exception.Message
+        if ($mergeError -match 'workflow scope|workflows?/.+without workflow scope|refusing to allow a Personal Access Token') {
+            $hint = "Der Classic PAT in WINGET_CREATE_GITHUB_TOKEN benötigt zusätzlich zum public_repo-Scope den workflow-Scope, weil microsoft/winget-pkgs regelmäßig Dateien unter .github/workflows ändert."
+            if ($Required) { throw "Fork-Sync fehlgeschlagen. $hint GitHub-Antwort: $mergeError" }
+            Write-Warning "$hint GitHub-Antwort: $mergeError"
             return $false
         }
+
+        if ($Required) {
+            throw "Fork-Sync über GitHub merge-upstream API fehlgeschlagen. GitHub-Antwort: $mergeError"
+        }
+        Write-Warning "Fork-Sync über GitHub merge-upstream API fehlgeschlagen: $mergeError"
+        return $false
     }
-    Confirm-ForkSync
-    return $true
+
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
+        if ($attempt -gt 1) { Start-Sleep -Seconds 2 }
+        $status = Get-ForkStatus
+        if ($status.Ahead -gt 0) {
+            throw "Fork hat nach dem Sync eigene Commits (ahead_by=$($status.Ahead))."
+        }
+        if ($status.Behind -eq 0) {
+            Write-Host "Fork-Sync erfolgreich abgeschlossen."
+            return $true
+        }
+    }
+
+    throw "Fork-Sync wurde ausgelöst, aber der Fork liegt weiterhin hinter upstream (behind_by=$($status.Behind))."
 }
 
 function Submit-WithRetry {
