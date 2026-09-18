@@ -59,8 +59,6 @@ Diese Secrets müssen in den Repository Settings hinterlegt werden:
 - `MAIL_FROM`
 - `MAIL_TO`
 
-> Niemals Passwörter oder Tokens in Dateien oder Commits ablegen.
-
 ## Manuell ausführen
 
 In GitHub unter **Actions** → Workflow auswählen → **Run workflow**.
