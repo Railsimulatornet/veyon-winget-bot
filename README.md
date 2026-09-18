@@ -25,7 +25,7 @@ Hintergrund: Die Veyon-Entwickler erstellen nicht immer zeitnah einen WinGet-Pul
   - aktuelle SHA256-Hashes,
   - `ReleaseNotesUrl` und `ReleaseDate`.
 - Erkennt bereits offene PRs, damit keine Duplikate erstellt werden.
-- Synchronisiert den eigenen `winget-pkgs`-Fork unmittelbar nach der Update-Erkennung und vor der Manifest-Erzeugung. Eigene Fork-Commits werden dabei nie überschrieben.
+- Synchronisiert den eigenen `winget-pkgs`-Fork unmittelbar nach der Update-Erkennung und vor der Manifest-Erzeugung über GitHubs `merge-upstream`-API. Eigene Fork-Commits werden dabei nie überschrieben.
 - Sendet E-Mail-Benachrichtigungen beim Start und Abschluss.
 
 ## Sicherheit
@@ -51,7 +51,7 @@ Standardmäßig alle **5 Minuten** per GitHub Actions Schedule (UTC).
 
 Diese Secrets müssen in den Repository Settings hinterlegt werden:
 
-- `WINGET_CREATE_GITHUB_TOKEN` (Classic PAT mit `public_repo` für `wingetcreate` und PR-Erstellung)
+- `WINGET_CREATE_GITHUB_TOKEN` (Classic PAT mit `public_repo` **und `workflow`**. Der zusätzliche `workflow`-Scope ist nötig, damit der eigene `winget-pkgs`-Fork auch dann mit `microsoft/winget-pkgs` synchronisiert werden kann, wenn upstream Dateien unter `.github/workflows` geändert hat.)
 - `MAIL_SERVER`
 - `MAIL_PORT`
 - `MAIL_USERNAME`
