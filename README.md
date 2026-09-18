@@ -1,4 +1,4 @@
-# Veyon → WinGet Bot (Automatischer PR-Ersteller)
+# Veyon → WinGet Bot (Automatischer PR-Ersteller) 
 
 Dieses Repository enthält einen kleinen Bot, der automatisch prüft, ob es eine neue **Veyon**-Version gibt oder ob ein bereits veröffentlichtes Veyon-Release-Asset unter derselben URL ersetzt wurde. Falls eine WinGet-Aktion nötig ist, erstellt der Bot automatisch einen Pull Request für `microsoft/winget-pkgs`.
 
