@@ -86,7 +86,7 @@ jobs:
           MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
           MAIL_FROM: ${{ secrets.MAIL_FROM }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
-          MAIL_SUBJECT: Veyon WinGet-Aktion gefunden: ${{ needs.check.outputs.version }}
+          MAIL_SUBJECT: "Veyon WinGet-Aktion gefunden: ${{ needs.check.outputs.version }}"
           MAIL_BODY: |
             Eine Veyon-WinGet-Aktion wurde gefunden.
 
@@ -191,7 +191,7 @@ jobs:
           MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
           MAIL_FROM: ${{ secrets.MAIL_FROM }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
-          MAIL_SUBJECT: Veyon WinGet-Prozess fertig: ${{ needs.submit.result }}
+          MAIL_SUBJECT: "Veyon WinGet-Prozess fertig: ${{ needs.submit.result }}"
           MAIL_BODY: |
             Status: ${{ needs.submit.result }}
 
