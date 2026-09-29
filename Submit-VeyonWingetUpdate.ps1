@@ -27,7 +27,12 @@ function Out-Gha {
     param([string]$Name, [AllowNull()][string]$Value)
     if ($null -eq $Value) { $Value = "" }
     if ($env:GITHUB_OUTPUT) {
-        "$Name=$Value" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+        $delimiter = "ghadelim_" + [guid]::NewGuid().ToString("N")
+        @(
+            "$Name<<$delimiter"
+            $Value
+            $delimiter
+        ) | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
     }
 }
 
@@ -59,8 +64,18 @@ function Headers {
         "User-Agent" = "veyon-winget-bot"
         "Accept" = "application/vnd.github+json"
     }
-    if ($env:WINGET_CREATE_GITHUB_TOKEN -and $env:WINGET_CREATE_GITHUB_TOKEN.Trim().Length -gt 0) {
-        $h["Authorization"] = "Bearer $($env:WINGET_CREATE_GITHUB_TOKEN)"
+
+    # Read-only checks use the repository-scoped GITHUB_TOKEN.
+    # The wider WINGET_CREATE_GITHUB_TOKEN is only exposed to sync/submit jobs.
+    $apiToken = ""
+    if ($env:GITHUB_API_TOKEN -and $env:GITHUB_API_TOKEN.Trim().Length -gt 0) {
+        $apiToken = $env:GITHUB_API_TOKEN.Trim()
+    } elseif ($env:WINGET_CREATE_GITHUB_TOKEN -and $env:WINGET_CREATE_GITHUB_TOKEN.Trim().Length -gt 0) {
+        $apiToken = $env:WINGET_CREATE_GITHUB_TOKEN.Trim()
+    }
+
+    if ($apiToken) {
+        $h["Authorization"] = "Bearer $apiToken"
     }
     return $h
 }
