@@ -32,6 +32,17 @@ Hintergrund: Die Veyon-Entwickler erstellen nicht immer zeitnah einen WinGet-Pul
 
 Die WinGet-Hashprüfung wird nicht umgangen. Wenn Veyon ein Release-Asset unter derselben URL ersetzt, erstellt der Bot stattdessen eine reguläre Korrektur-PR, die weiterhin die Validierungs- und Review-Prozesse von `microsoft/winget-pkgs` durchläuft.
 
+Zusätzlich ist der GitHub-Actions-Ablauf bewusst getrennt und gehärtet:
+
+- Der reine Versions-/Hash-Check verwendet nur das repositorygebundene, lesende `GITHUB_TOKEN`.
+- `WINGET_CREATE_GITHUB_TOKEN` wird ausschließlich in den Jobs verwendet, die den WinGet-Fork synchronisieren oder eine PR einreichen.
+- E-Mail-Benachrichtigungen laufen getrennt von den Submit-Schritten und erhalten keinen WinGet-PAT.
+- Der Mailversand erfolgt über ein eigenes kleines Python-Skript mit Zertifikatsprüfung und verpflichtendem TLS (STARTTLS bzw. SMTPS auf Port 465).
+- Externe GitHub Actions sind auf unveränderliche Commit-SHAs gepinnt.
+- WingetCreate wird im CI-Lauf auf die getestete Version `1.12.13.0` festgelegt und nach der Installation geprüft.
+- Ein eigener PR-Workflow prüft PowerShell-Syntax, Mail-Skript, unveränderliche Action-Referenzen und führt einen read-only `-CheckOnly`-Lauf aus.
+- Dependabot überwacht die verwendeten GitHub Actions auf Updates.
+
 ## Wie oft läuft das?
 
 Standardmäßig alle **5 Minuten** per GitHub Actions Schedule (UTC).
@@ -51,7 +62,7 @@ Standardmäßig alle **5 Minuten** per GitHub Actions Schedule (UTC).
 
 Diese Secrets müssen in den Repository Settings hinterlegt werden:
 
-- `WINGET_CREATE_GITHUB_TOKEN` (Classic PAT mit `public_repo` **und `workflow`**. Der zusätzliche `workflow`-Scope ist nötig, damit der eigene `winget-pkgs`-Fork auch dann mit `microsoft/winget-pkgs` synchronisiert werden kann, wenn upstream Dateien unter `.github/workflows` geändert hat.)
+- `WINGET_CREATE_GITHUB_TOKEN` (Classic PAT mit `public_repo` **und `workflow`**. Der zusätzliche `workflow`-Scope ist nötig, damit der eigene `winget-pkgs`-Fork auch dann mit `microsoft/winget-pkgs` synchronisiert werden kann, wenn upstream Dateien unter `.github/workflows` geändert hat. Dieses Secret wird nur den Sync-/Submit-Jobs zur Verfügung gestellt, nicht dem regelmäßigen Check oder den Mail-Jobs.)
 - `MAIL_SERVER`
 - `MAIL_PORT`
 - `MAIL_USERNAME`
