@@ -75,7 +75,8 @@ jobs:
             throw "All external GitHub Actions must be pinned to an immutable commit SHA."
           }
 
-          if (Select-String -Path .github/workflows/*.yml,.github/workflows/*.yaml -Pattern 'dawidd6/action-send-mail' -ErrorAction SilentlyContinue) {
+          $forbiddenMailAction = 'dawidd6' + '/action-send-mail'
+          if (Select-String -Path .github/workflows/*.yml,.github/workflows/*.yaml -Pattern ([regex]::Escape($forbiddenMailAction)) -ErrorAction SilentlyContinue) {
             throw "Third-party mail Action must not be used. Use the local TLS mail helper."
           }
 
