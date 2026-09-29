@@ -14,84 +14,151 @@ concurrency:
   group: veyon-winget
   cancel-in-progress: true
 
+env:
+  WINGETCREATE_VERSION: "1.12.13.0"
+
 jobs:
-  veyon-winget:
+  check:
     runs-on: windows-latest
+    timeout-minutes: 10
+    outputs:
+      needsUpdate: ${{ steps.meta.outputs.needsUpdate }}
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      notesUrl: ${{ steps.meta.outputs.notesUrl }}
+      releaseDate: ${{ steps.meta.outputs.releaseDate }}
+      existingPrUrl: ${{ steps.meta.outputs.existingPrUrl }}
+      reason: ${{ steps.meta.outputs.reason }}
+      changeType: ${{ steps.meta.outputs.changeType }}
+      manifestUrl: ${{ steps.meta.outputs.manifestUrl }}
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Determine required Veyon WinGet action
         id: meta
         shell: pwsh
         env:
-          WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_CREATE_GITHUB_TOKEN }}
+          GITHUB_API_TOKEN: ${{ github.token }}
         run: |
-          pwsh -File .\Submit-VeyonWingetUpdate.ps1 -CheckOnly
-
-      - name: Send START email (new version or hash correction found)
-        if: steps.meta.outputs.needsUpdate == 'true'
-        continue-on-error: true
-        uses: dawidd6/action-send-mail@master
-        with:
-          server_address: ${{ secrets.MAIL_SERVER }}
-          server_port: ${{ secrets.MAIL_PORT }}
-          username: ${{ secrets.MAIL_USERNAME }}
-          password: ${{ secrets.MAIL_PASSWORD }}
-          subject: "Veyon WinGet-Aktion gefunden: ${{ steps.meta.outputs.version }}"
-          from: ${{ secrets.MAIL_FROM }}
-          to: ${{ secrets.MAIL_TO }}
-          body: |
-            Eine Veyon-WinGet-Aktion wurde gefunden.
-
-            Änderungstyp: ${{ steps.meta.outputs.changeType }}
-            WinGet-Version: ${{ steps.meta.outputs.version }}
-            GitHub Release Tag: ${{ steps.meta.outputs.tag }}
-            Release Notes: ${{ steps.meta.outputs.notesUrl }}
-            Release Date: ${{ steps.meta.outputs.releaseDate }}
-            Bestehendes Manifest: ${{ steps.meta.outputs.manifestUrl }}
-
-            Grund:
-            ${{ steps.meta.outputs.reason }}
-
-            Prozess startet jetzt.
-
-      - name: Synchronize WinGet fork with upstream
-        if: steps.meta.outputs.needsUpdate == 'true'
-        shell: pwsh
-        env:
-          WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_CREATE_GITHUB_TOKEN }}
-        run: |
-          pwsh -File .\Submit-VeyonWingetUpdate.ps1 -SyncForkOnly
+          pwsh -NoProfile -NonInteractive -File .\Submit-VeyonWingetUpdate.ps1 -CheckOnly
 
       - name: "Info: No action needed"
         if: steps.meta.outputs.needsUpdate != 'true'
         shell: pwsh
+        env:
+          CHANGE_TYPE: ${{ steps.meta.outputs.changeType }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          REASON: ${{ steps.meta.outputs.reason }}
+          EXISTING_PR: ${{ steps.meta.outputs.existingPrUrl }}
+          MANIFEST_URL: ${{ steps.meta.outputs.manifestUrl }}
         run: |
           Write-Host "Keine neue PR nötig."
-          Write-Host "Änderungstyp: ${{ steps.meta.outputs.changeType }}"
-          Write-Host "Version: ${{ steps.meta.outputs.version }}"
-          Write-Host "Grund: ${{ steps.meta.outputs.reason }}"
-          Write-Host "Bestehende PR: ${{ steps.meta.outputs.existingPrUrl }}"
-          Write-Host "Manifest: ${{ steps.meta.outputs.manifestUrl }}"
+          Write-Host "Änderungstyp: $env:CHANGE_TYPE"
+          Write-Host "Version: $env:VERSION"
+          Write-Host "Grund: $env:REASON"
+          Write-Host "Bestehende PR: $env:EXISTING_PR"
+          Write-Host "Manifest: $env:MANIFEST_URL"
 
-      - name: Install WingetCreate
-        if: steps.meta.outputs.needsUpdate == 'true'
-        shell: pwsh
-        run: |
-          winget install -e --id Microsoft.WingetCreate --accept-package-agreements --accept-source-agreements
+  notify-start:
+    needs: check
+    if: needs.check.outputs.needsUpdate == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
 
-      - name: Run Submit-VeyonWingetUpdate.ps1 (generate, guard, submit PR)
-        if: steps.meta.outputs.needsUpdate == 'true'
-        id: submit
+    steps:
+      - name: Checkout mail helper
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Send START email
+        continue-on-error: true
+        env:
+          MAIL_SERVER: ${{ secrets.MAIL_SERVER }}
+          MAIL_PORT: ${{ secrets.MAIL_PORT }}
+          MAIL_USERNAME: ${{ secrets.MAIL_USERNAME }}
+          MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
+          MAIL_FROM: ${{ secrets.MAIL_FROM }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+          MAIL_SUBJECT: "Veyon WinGet-Aktion gefunden: ${{ needs.check.outputs.version }}"
+          MAIL_BODY: |
+            Eine Veyon-WinGet-Aktion wurde gefunden.
+
+            Änderungstyp: ${{ needs.check.outputs.changeType }}
+            WinGet-Version: ${{ needs.check.outputs.version }}
+            GitHub Release Tag: ${{ needs.check.outputs.tag }}
+            Release Notes: ${{ needs.check.outputs.notesUrl }}
+            Release Date: ${{ needs.check.outputs.releaseDate }}
+            Bestehendes Manifest: ${{ needs.check.outputs.manifestUrl }}
+
+            Grund:
+            ${{ needs.check.outputs.reason }}
+
+            Prozess startet jetzt.
+        run: python3 .github/scripts/send_mail.py
+
+  submit:
+    needs: [check, notify-start]
+    if: always() && needs.check.result == 'success' && needs.check.outputs.needsUpdate == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    outputs:
+      prUrl: ${{ steps.submit.outputs.prUrl }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Synchronize WinGet fork with upstream
         shell: pwsh
         env:
           WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_CREATE_GITHUB_TOKEN }}
         run: |
+          pwsh -NoProfile -NonInteractive -File .\Submit-VeyonWingetUpdate.ps1 -SyncForkOnly
+
+      - name: Install pinned WingetCreate
+        shell: pwsh
+        run: |
+          winget install -e --id Microsoft.WingetCreate --version "$env:WINGETCREATE_VERSION" --source winget --accept-package-agreements --accept-source-agreements --disable-interactivity
+          if ($LASTEXITCODE -ne 0) {
+            throw "WingetCreate installation failed with exit code $LASTEXITCODE."
+          }
+
+          $installed = (winget list -e --id Microsoft.WingetCreate --source winget --accept-source-agreements --disable-interactivity | Out-String)
+          if ($installed -notmatch [regex]::Escape($env:WINGETCREATE_VERSION)) {
+            throw "Expected WingetCreate $env:WINGETCREATE_VERSION was not found after installation."
+          }
+
+          & wingetcreate --help *> $null
+          if ($LASTEXITCODE -ne 0) {
+            throw "WingetCreate executable check failed with exit code $LASTEXITCODE."
+          }
+
+          Write-Host "WingetCreate $env:WINGETCREATE_VERSION verified."
+
+      - name: Run Submit-VeyonWingetUpdate.ps1 (generate, guard, submit PR)
+        id: submit
+        shell: pwsh
+        env:
+          WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_CREATE_GITHUB_TOKEN }}
+          VEYON_VERSION: ${{ needs.check.outputs.version }}
+        run: |
           $log = Join-Path $env:RUNNER_TEMP "wingetcreate.log"
 
-          pwsh -File .\Submit-VeyonWingetUpdate.ps1 -Version "${{ steps.meta.outputs.version }}" *>&1 | Tee-Object -FilePath $log
+          pwsh -NoProfile -NonInteractive -File .\Submit-VeyonWingetUpdate.ps1 -Version "$env:VEYON_VERSION" *>&1 | Tee-Object -FilePath $log
+          if ($LASTEXITCODE -ne 0) {
+            throw "Submit-VeyonWingetUpdate.ps1 failed with exit code $LASTEXITCODE."
+          }
 
           $pr = Select-String -Path $log -Pattern "https://github\.com/microsoft/winget-pkgs/pull/\d+" -AllMatches |
                 ForEach-Object { $_.Matches.Value } |
@@ -101,33 +168,46 @@ jobs:
             "prUrl=$pr" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           }
 
-      - name: Send END email (success/fail)
-        if: ${{ always() && steps.meta.outputs.needsUpdate == 'true' }}
-        continue-on-error: true
-        uses: dawidd6/action-send-mail@master
+  notify-end:
+    needs: [check, submit]
+    if: always() && needs.check.outputs.needsUpdate == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout mail helper
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          server_address: ${{ secrets.MAIL_SERVER }}
-          server_port: ${{ secrets.MAIL_PORT }}
-          username: ${{ secrets.MAIL_USERNAME }}
-          password: ${{ secrets.MAIL_PASSWORD }}
-          subject: "Veyon WinGet-Prozess fertig: ${{ job.status }}"
-          from: ${{ secrets.MAIL_FROM }}
-          to: ${{ secrets.MAIL_TO }}
-          body: |
-            Status: ${{ job.status }}
+          persist-credentials: false
 
-            Änderungstyp: ${{ steps.meta.outputs.changeType }}
-            WinGet-Version: ${{ steps.meta.outputs.version }}
-            GitHub Release Tag: ${{ steps.meta.outputs.tag }}
-            Release Notes: ${{ steps.meta.outputs.notesUrl }}
-            Release Date: ${{ steps.meta.outputs.releaseDate }}
-            Bestehendes Manifest: ${{ steps.meta.outputs.manifestUrl }}
+      - name: Send END email
+        continue-on-error: true
+        env:
+          MAIL_SERVER: ${{ secrets.MAIL_SERVER }}
+          MAIL_PORT: ${{ secrets.MAIL_PORT }}
+          MAIL_USERNAME: ${{ secrets.MAIL_USERNAME }}
+          MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
+          MAIL_FROM: ${{ secrets.MAIL_FROM }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+          MAIL_SUBJECT: "Veyon WinGet-Prozess fertig: ${{ needs.submit.result }}"
+          MAIL_BODY: |
+            Status: ${{ needs.submit.result }}
 
-            Neue PR: ${{ steps.submit.outputs.prUrl }}
-            Bereits offene PR: ${{ steps.meta.outputs.existingPrUrl }}
+            Änderungstyp: ${{ needs.check.outputs.changeType }}
+            WinGet-Version: ${{ needs.check.outputs.version }}
+            GitHub Release Tag: ${{ needs.check.outputs.tag }}
+            Release Notes: ${{ needs.check.outputs.notesUrl }}
+            Release Date: ${{ needs.check.outputs.releaseDate }}
+            Bestehendes Manifest: ${{ needs.check.outputs.manifestUrl }}
+
+            Neue PR: ${{ needs.submit.outputs.prUrl }}
+            Bereits offene PR: ${{ needs.check.outputs.existingPrUrl }}
 
             Grund:
-            ${{ steps.meta.outputs.reason }}
+            ${{ needs.check.outputs.reason }}
 
             Run:
             https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: python3 .github/scripts/send_mail.py

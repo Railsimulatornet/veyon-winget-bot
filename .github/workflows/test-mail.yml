@@ -3,21 +3,31 @@ name: Test Mail (SMTP)
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   test-mail:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+
     steps:
-      - name: Send test mail
-        uses: dawidd6/action-send-mail@v3
+      - name: Checkout mail helper
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          server_address: ${{ secrets.MAIL_SERVER }}
-          server_port: ${{ secrets.MAIL_PORT }}
-          username: ${{ secrets.MAIL_USERNAME }}
-          password: ${{ secrets.MAIL_PASSWORD }}
-          subject: "✅ Testmail: veyon-winget-bot"
-          from: ${{ secrets.MAIL_FROM }}
-          to: ${{ secrets.MAIL_TO }}
-          body: |
+          persist-credentials: false
+
+      - name: Send test mail with verified TLS
+        env:
+          MAIL_SERVER: ${{ secrets.MAIL_SERVER }}
+          MAIL_PORT: ${{ secrets.MAIL_PORT }}
+          MAIL_USERNAME: ${{ secrets.MAIL_USERNAME }}
+          MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
+          MAIL_FROM: ${{ secrets.MAIL_FROM }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+          MAIL_SUBJECT: "✅ Testmail: veyon-winget-bot"
+          MAIL_BODY: |
             Das ist eine Testmail aus GitHub Actions.
             Repo: ${{ github.repository }}
             Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: python3 .github/scripts/send_mail.py

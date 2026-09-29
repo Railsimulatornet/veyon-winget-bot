@@ -1,0 +1,90 @@
+name: Security & Workflow Validation
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Parse PowerShell
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path ".\Submit-VeyonWingetUpdate.ps1"),
+            [ref]$tokens,
+            [ref]$errors
+          ) | Out-Null
+
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Error $_.Message }
+            throw "PowerShell parser found $($errors.Count) error(s)."
+          }
+
+          Write-Host "PowerShell parser: OK"
+
+      - name: Validate mail helper syntax
+        shell: pwsh
+        run: |
+          python -m py_compile .github/scripts/send_mail.py
+          if ($LASTEXITCODE -ne 0) {
+            throw "Python mail helper syntax validation failed."
+          }
+          Write-Host "Python mail helper: OK"
+
+      - name: Enforce immutable external Action references
+        shell: pwsh
+        run: |
+          $violations = @()
+
+          Get-ChildItem .github/workflows -File | Where-Object {
+            $_.Extension -in ".yml", ".yaml"
+          } | ForEach-Object {
+            $file = $_
+            foreach ($line in Get-Content $file.FullName) {
+              if ($line -match '^\s*uses:\s+([^\s]+)') {
+                $reference = $Matches[1]
+                if ($reference.StartsWith("./")) {
+                  continue
+                }
+                if ($reference -notmatch '@[0-9a-fA-F]{40}$') {
+                  $violations += "$($file.Name): $reference"
+                }
+              }
+            }
+          }
+
+          if ($violations.Count -gt 0) {
+            $violations | ForEach-Object { Write-Error "Mutable Action reference: $_" }
+            throw "All external GitHub Actions must be pinned to an immutable commit SHA."
+          }
+
+          $forbiddenMailAction = 'dawidd6' + '/action-send-mail'
+          if (Select-String -Path .github/workflows/*.yml,.github/workflows/*.yaml -Pattern ([regex]::Escape($forbiddenMailAction)) -ErrorAction SilentlyContinue) {
+            throw "Third-party mail Action must not be used. Use the local TLS mail helper."
+          }
+
+          Write-Host "External Action references: OK"
+
+      - name: Run read-only Veyon check
+        shell: pwsh
+        env:
+          GITHUB_API_TOKEN: ${{ github.token }}
+        run: |
+          pwsh -NoProfile -NonInteractive -File .\Submit-VeyonWingetUpdate.ps1 -CheckOnly
