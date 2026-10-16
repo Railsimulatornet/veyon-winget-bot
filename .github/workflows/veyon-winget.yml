@@ -129,22 +129,31 @@ jobs:
       - name: Install pinned WingetCreate
         shell: pwsh
         run: |
-          winget install -e --id Microsoft.WingetCreate --version "$env:WINGETCREATE_VERSION" --source winget --accept-package-agreements --accept-source-agreements --disable-interactivity
+          $ErrorActionPreference = 'Stop'
+          $toolDir = Join-Path $env:RUNNER_TEMP 'wingetcreate-bin'
+          New-Item -Path $toolDir -ItemType Directory -Force | Out-Null
+          $exe = Join-Path $toolDir 'wingetcreate.exe'
+          $url = "https://github.com/microsoft/winget-create/releases/download/v$env:WINGETCREATE_VERSION/wingetcreate.exe"
+          Write-Host "Lade WingetCreate $env:WINGETCREATE_VERSION (portable) von Microsoft."
+          Invoke-WebRequest -Uri $url -OutFile $exe -TimeoutSec 180
+
+          # SHA256 des offiziellen GitHub-Release-Assets v1.12.13.0
+          $expectedSha256 = '24042BD37915805615E6CF969AC57C6439124C3FE85823327F5F3FB24BD9FFEA'
+          $actualSha256 = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToUpperInvariant()
+          if ($actualSha256 -ne $expectedSha256) {
+            throw "WingetCreate SHA256 mismatch: expected $expectedSha256, got $actualSha256."
+          }
+          Write-Host "WingetCreate SHA256 erfolgreich geprüft."
+
+          # Tatsächlichen CLI-Start prüfen, ohne Fehlermeldungen zu unterdrücken.
+          & $exe info
           if ($LASTEXITCODE -ne 0) {
-            throw "WingetCreate installation failed with exit code $LASTEXITCODE."
+            throw "WingetCreate info failed with exit code $LASTEXITCODE."
           }
 
-          $installed = (winget list -e --id Microsoft.WingetCreate --source winget --accept-source-agreements --disable-interactivity | Out-String)
-          if ($installed -notmatch [regex]::Escape($env:WINGETCREATE_VERSION)) {
-            throw "Expected WingetCreate $env:WINGETCREATE_VERSION was not found after installation."
-          }
-
-          & wingetcreate --help *> $null
-          if ($LASTEXITCODE -ne 0) {
-            throw "WingetCreate executable check failed with exit code $LASTEXITCODE."
-          }
-
-          Write-Host "WingetCreate $env:WINGETCREATE_VERSION verified."
+          # Für den folgenden Submit-Step im PATH verfügbar machen.
+          $toolDir | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          Write-Host "WingetCreate $env:WINGETCREATE_VERSION (portable) bereit."
 
       - name: Run Submit-VeyonWingetUpdate.ps1 (generate, guard, submit PR)
         id: submit
