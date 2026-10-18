@@ -1,5 +1,8 @@
 # Veyon → WinGet Bot (Automatischer PR-Ersteller) 
 
+[![WinGet](https://github.com/Railsimulatornet/veyon-winget-bot/actions/workflows/veyon-winget.yml/badge.svg?branch=main)](https://github.com/Railsimulatornet/veyon-winget-bot/actions/workflows/veyon-winget.yml)
+[![Security](https://github.com/Railsimulatornet/veyon-winget-bot/actions/workflows/security-validation.yml/badge.svg?branch=main)](https://github.com/Railsimulatornet/veyon-winget-bot/actions/workflows/security-validation.yml)
+
 Dieses Repository enthält einen kleinen Bot, der automatisch prüft, ob es eine neue **Veyon**-Version gibt oder ob ein bereits veröffentlichtes Veyon-Release-Asset unter derselben URL ersetzt wurde. Falls eine WinGet-Aktion nötig ist, erstellt der Bot automatisch einen Pull Request für `microsoft/winget-pkgs`.
 
 Hintergrund: Die Veyon-Entwickler erstellen nicht immer zeitnah einen WinGet-Pull-Request. Außerdem können ersetzte Release-Assets dazu führen, dass der im WinGet-Manifest gespeicherte SHA256-Hash nicht mehr zum aktuellen Installer passt. Damit mein eigener **Veyon WinGet Updater** zuverlässig und ohne Umgehung der Hashprüfung arbeiten kann, übernimmt dieser Bot den PR-Prozess automatisiert.
