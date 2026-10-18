@@ -72,7 +72,7 @@ Der Zeitplan `*/5 * * * *` sieht einen Lauf alle fünf Minuten vor. GitHub Actio
 
 Der regelmäßige Check verwendet das lesende, repositorygebundene `GITHUB_TOKEN`. Der WinGet-PAT steht ausschließlich den Jobs für Synchronisierung und Einreichen zur Verfügung. Die Mail-Jobs laufen getrennt und erhalten diesen PAT nicht.
 
-Externe Actions sind auf Commit-SHAs festgelegt. Dependabot prüft sie auf Updates. Der [Prüfworkflow](.github/workflows/security-validation.yml) kontrolliert unter anderem PowerShell-Syntax, Mailversand, Action-Referenzen und den lesenden `-CheckOnly`-Aufruf.
+Externe Actions sind auf Commit-SHAs festgelegt. Dependabot prüft sie auf Updates. Der [Prüfworkflow](.github/workflows/security-validation.yml) kontrolliert unter anderem PowerShell-Syntax, Syntax des Mail-Skripts, Action-Referenzen und den lesenden `-CheckOnly`-Aufruf.
 
 ### Projektdateien
 
@@ -152,7 +152,7 @@ The `*/5 * * * *` schedule requests a run every five minutes. GitHub Actions may
 
 The regular check uses the read-only, repository-scoped `GITHUB_TOKEN`. The WinGet PAT is available only to the synchronization and submission jobs. Email jobs run separately and do not receive this PAT.
 
-External Actions are pinned to commit SHAs and monitored by Dependabot. The [validation workflow](.github/workflows/security-validation.yml) checks PowerShell syntax, email handling, Action references and the read-only `-CheckOnly` command, among other checks.
+External Actions are pinned to commit SHAs and monitored by Dependabot. The [validation workflow](.github/workflows/security-validation.yml) checks PowerShell syntax, mail script syntax, Action references and the read-only `-CheckOnly` command, among other checks.
 
 ### Project files
 
