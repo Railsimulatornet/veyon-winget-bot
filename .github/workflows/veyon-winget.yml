@@ -3,7 +3,9 @@ name: Veyon -> WinGet PR Automation
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/5 * * * *"
+    # Zwei versetzte Prüftermine als Reserve bei ausgelassenen GitHub-Cron-Ereignissen.
+    - cron: "17 */2 * * *"
+    - cron: "47 */2 * * *"
   repository_dispatch:
     types: [veyon_check_now]
 
@@ -12,7 +14,7 @@ permissions:
 
 concurrency:
   group: veyon-winget
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   WINGETCREATE_VERSION: "1.12.13.0"
@@ -78,7 +80,6 @@ jobs:
           persist-credentials: false
 
       - name: Send START email
-        continue-on-error: true
         env:
           MAIL_SERVER: ${{ secrets.MAIL_SERVER }}
           MAIL_PORT: ${{ secrets.MAIL_PORT }}
@@ -179,7 +180,7 @@ jobs:
 
   notify-end:
     needs: [check, submit]
-    if: always() && needs.check.outputs.needsUpdate == 'true'
+    if: always() && (needs.check.result != 'success' || needs.check.outputs.needsUpdate == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -192,7 +193,6 @@ jobs:
           persist-credentials: false
 
       - name: Send END email
-        continue-on-error: true
         env:
           MAIL_SERVER: ${{ secrets.MAIL_SERVER }}
           MAIL_PORT: ${{ secrets.MAIL_PORT }}
@@ -200,9 +200,10 @@ jobs:
           MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
           MAIL_FROM: ${{ secrets.MAIL_FROM }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
-          MAIL_SUBJECT: "Veyon WinGet-Prozess fertig: ${{ needs.submit.result }}"
+          MAIL_SUBJECT: "Veyon WinGet: Check ${{ needs.check.result }}, PR ${{ needs.submit.result }}"
           MAIL_BODY: |
-            Status: ${{ needs.submit.result }}
+            Prüfung: ${{ needs.check.result }}
+            PR: ${{ needs.submit.result }}
 
             Änderungstyp: ${{ needs.check.outputs.changeType }}
             WinGet-Version: ${{ needs.check.outputs.version }}
