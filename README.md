@@ -59,7 +59,9 @@ pwsh -NoProfile -NonInteractive -File .\Submit-VeyonWingetUpdate.ps1 -CheckOnly
 
 ### Zeitplan und Ablauf
 
-Der Zeitplan `*/5 * * * *` sieht einen Lauf alle fünf Minuten vor. GitHub Actions kann geplante Läufe verzögert ausführen. Zusätzlich sind ein manueller Start und ein `repository_dispatch` mit dem Ereignistyp `veyon_check_now` vorgesehen.
+Der Bot prüft um `17` und `47` Minuten nach jeder geraden UTC-Stunde. Das ergibt zwei zeitversetzte Versuche pro Zweistundenfenster. GitHub kann geplante Ausführungen verzögern oder auslassen; der zweite Termin ist eine zusätzliche Chance, keine Garantie. Manuelle Starts und `repository_dispatch` mit dem Ereignistyp `veyon_check_now` bleiben möglich.
+
+Unabhängig davon kontrolliert ein stündlicher **ChatGPT-Ausfallwächter** die GitHub-Läufe. Er meldet ausbleibende automatische Prüfungen nach mehr als vier Stunden, neue Fehler und fehlende WinGet-Aktualisierungen. Dieser Wächter läuft **außerhalb von GitHub** und ist nicht Teil des Repositories; er löst keine Workflows selbst aus. Bei öffentlichen Repositories deaktiviert GitHub den Zeitplan nach 60 Tagen ohne Aktivität. Auch davor warnt der Wächter.
 
 1. Stabile Veyon-Releases und Windows-Installer ermitteln.
 2. Vorhandenes WinGet-Manifest laden und URL sowie Asset-Digests vergleichen.
@@ -70,7 +72,7 @@ Der Zeitplan `*/5 * * * *` sieht einen Lauf alle fünf Minuten vor. GitHub Actio
 
 ### Prüfungen und Sicherheit
 
-Der regelmäßige Check verwendet das lesende, repositorygebundene `GITHUB_TOKEN`. Der WinGet-PAT steht ausschließlich den Jobs für Synchronisierung und Einreichen zur Verfügung. Die Mail-Jobs laufen getrennt und erhalten diesen PAT nicht.
+Der regelmäßige Check verwendet das lesende, repositorygebundene `GITHUB_TOKEN`. Der WinGet-PAT steht ausschließlich den Jobs für Synchronisierung und Einreichen zur Verfügung. Die Mail-Jobs laufen getrennt und erhalten diesen PAT nicht. Wenn die Prüfung oder der Mailversand fehlschlägt, bleibt das nicht mehr als erfolgreicher Lauf verborgen.
 
 Externe Actions sind auf Commit-SHAs festgelegt. Dependabot prüft sie auf Updates. Der [Prüfworkflow](.github/workflows/security-validation.yml) kontrolliert unter anderem PowerShell-Syntax, Syntax des Mail-Skripts, Action-Referenzen und den lesenden `-CheckOnly`-Aufruf.
 
@@ -139,7 +141,9 @@ pwsh -NoProfile -NonInteractive -File .\Submit-VeyonWingetUpdate.ps1 -CheckOnly
 
 ### Schedule and process
 
-The `*/5 * * * *` schedule requests a run every five minutes. GitHub Actions may delay scheduled runs. Manual runs and a `repository_dispatch` event of type `veyon_check_now` are also supported.
+Checks are scheduled at minute `17` and `47` of every even UTC hour: two staggered attempts in each two-hour window. GitHub may delay or drop schedule events; the second attempt improves the chances but does not guarantee execution. Manual runs and `repository_dispatch` with event type `veyon_check_now` remain available.
+
+A separate **hourly ChatGPT outage monitor** checks GitHub workflow runs independently of GitHub's scheduler. It alerts on missing scheduled runs (over four hours), new failures, and missing WinGet updates. This monitor is managed **outside this repository** and does not dispatch runs. GitHub automatically disables scheduled workflows on public repositories after 60 days without activity; the monitor warns about that risk too.
 
 1. Identify stable Veyon releases and Windows installers.
 2. Load the existing WinGet manifest and compare URLs and asset digests.
@@ -150,7 +154,7 @@ The `*/5 * * * *` schedule requests a run every five minutes. GitHub Actions may
 
 ### Checks and security
 
-The regular check uses the read-only, repository-scoped `GITHUB_TOKEN`. The WinGet PAT is available only to the synchronization and submission jobs. Email jobs run separately and do not receive this PAT.
+The regular check uses the read-only, repository-scoped `GITHUB_TOKEN`. The WinGet PAT is available only to the synchronization and submission jobs. Email jobs run separately and do not receive this PAT. Failed checks or email delivery are no longer hidden behind an otherwise successful run.
 
 External Actions are pinned to commit SHAs and monitored by Dependabot. The [validation workflow](.github/workflows/security-validation.yml) checks PowerShell syntax, mail script syntax, Action references and the read-only `-CheckOnly` command, among other checks.
 
