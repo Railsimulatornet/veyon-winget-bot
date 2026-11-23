@@ -6,6 +6,11 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      live_check:
+        description: Zusätzlich den echten GitHub-Zugriff lesend prüfen
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -87,9 +92,29 @@ jobs:
 
           Write-Host "External Action references: OK"
 
-      - name: Run read-only Veyon check
+      - name: Test full CheckOnly decisions without external requests
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -NonInteractive -File tests/Test-CheckOnly.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'Offline CheckOnly regression failed.' }
+          'Offline-Codeprüfung erfolgreich. Die aktuelle GitHub-Erreichbarkeit wurde damit nicht geprüft.' >> $env:GITHUB_STEP_SUMMARY
+
+  live-check:
+    name: Live-Zugriff auf GitHub (nur auf Anforderung)
+    if: github.event_name == 'workflow_dispatch' && inputs.live_check
+    needs: validate
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: Run read-only check against the actual GitHub API
         shell: pwsh
         env:
           GITHUB_API_TOKEN: ${{ github.token }}
         run: |
           pwsh -NoProfile -NonInteractive -File .\Submit-VeyonWingetUpdate.ps1 -CheckOnly
+          if ($LASTEXITCODE -ne 0) { throw 'Live-GitHub-Prüfung fehlgeschlagen; keine erfolgreiche Erreichbarkeit bestätigt.' }
