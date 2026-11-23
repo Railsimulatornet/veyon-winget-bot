@@ -20,6 +20,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Parse PowerShell
         shell: pwsh
@@ -48,6 +49,10 @@ jobs:
           }
           Write-Host "Python mail helper: OK"
 
+      - name: Test manifest reads and rate-limit handling without network access
+        shell: pwsh
+        run: pwsh -NoProfile -NonInteractive -File tests/Test-ManifestRead.ps1
+
       - name: Enforce immutable external Action references
         shell: pwsh
         run: |
@@ -58,7 +63,7 @@ jobs:
           } | ForEach-Object {
             $file = $_
             foreach ($line in Get-Content $file.FullName) {
-              if ($line -match '^\s*uses:\s+([^\s]+)') {
+              if ($line -match '^\s*(?:-\s*)?uses:\s+([^\s]+)') {
                 $reference = $Matches[1]
                 if ($reference.StartsWith("./")) {
                   continue
