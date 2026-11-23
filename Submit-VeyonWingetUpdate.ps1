@@ -302,25 +302,81 @@ function Get-CurrentAssetRecords {
     return @($records)
 }
 
+function Invoke-ManifestRead {
+    param([string]$Uri)
+
+    # Only retry this read. Submission and fork synchronization are never retried here.
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        $response = Invoke-WebRequest -Uri $Uri -Headers (Headers) -SkipHttpErrorCheck -TimeoutSec 60
+        $status = [int]$response.StatusCode
+        if ($status -in @(200, 404)) { return $response }
+
+        $retryAfter = [string]$response.Headers['Retry-After']
+        $remaining = [string]$response.Headers['X-RateLimit-Remaining']
+        $reset = [string]$response.Headers['X-RateLimit-Reset']
+        $rateLimited = $status -eq 429 -or ($status -eq 403 -and ($retryAfter -or $remaining -eq '0'))
+        $transient = $status -in @(500, 502, 503, 504)
+        if ((-not $rateLimited -and -not $transient) -or $attempt -eq 3) {
+            throw "Installer-Manifest konnte nicht gelesen werden (HTTP $status, Versuch $attempt): $Uri"
+        }
+
+        $delay = if ($rateLimited) { 60 } else { [int][Math]::Pow(2, $attempt) }
+        if ($retryAfter) {
+            $seconds = 0
+            if (-not [int]::TryParse($retryAfter, [ref]$seconds) -or $seconds -lt 0) {
+                throw "Ungültiger Retry-After-Wert beim Lesen des Installer-Manifests (HTTP $status)."
+            }
+            $delay = [Math]::Max($delay, $seconds)
+        }
+        if ($remaining -eq '0' -and $reset) {
+            $resetAt = 0L
+            if (-not [long]::TryParse($reset, [ref]$resetAt)) {
+                throw "Ungültiger X-RateLimit-Reset-Wert beim Lesen des Installer-Manifests."
+            }
+            $delay = [Math]::Max($delay, $resetAt - [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + 1)
+        }
+        if ($delay -gt 60) {
+            throw "GitHub begrenzt den Manifestabruf für weitere $delay Sekunden. Keine PR erstellt; der nächste geplante Lauf prüft erneut."
+        }
+        Write-Warning "Manifestabruf vorübergehend nicht möglich (HTTP $status). Erneuter Leseversuch in $delay Sekunden."
+        Start-Sleep -Seconds $delay
+    }
+}
+
 function Get-WingetInstallerManifest {
     param([string]$V)
 
+    if ($PackageId -notmatch '^[A-Za-z0-9][A-Za-z0-9_-]*(\.[A-Za-z0-9][A-Za-z0-9_-]*)+$' -or
+        $V -notmatch '^\d+\.\d+\.\d+\.\d+$') {
+        throw "Ungültige Paketkennung oder Version für den Manifestabruf."
+    }
     $segments = @($PackageId -split '\.')
-    if ($segments.Count -lt 2) { throw "PackageId hat ein unerwartetes Format: $PackageId" }
     $bucket = $PackageId.Substring(0,1).ToLowerInvariant()
     $packagePath = $segments -join '/'
+    $path = "manifests/$bucket/$packagePath/$V/$PackageId.installer.yaml"
 
     foreach ($branch in @("master","main")) {
-        $url = "https://raw.githubusercontent.com/microsoft/winget-pkgs/$branch/manifests/$bucket/$packagePath/$V/$PackageId.installer.yaml"
-        $response = Invoke-WebRequest -Uri ($url + "?t=" + [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) -Headers @{ "User-Agent" = "veyon-winget-bot"; "Cache-Control" = "no-cache" } -SkipHttpErrorCheck -TimeoutSec 60
+        # Use GitHub's authenticated contents API instead of an uncached CDN request.
+        $url = "https://api.github.com/repos/microsoft/winget-pkgs/contents/${path}?ref=$branch"
+        $response = Invoke-ManifestRead $url
         $status = [int]$response.StatusCode
         if ($status -eq 200) {
+            $file = $response.Content | ConvertFrom-Json
+            if ((Get-ObjectProperty $file 'type') -ne 'file' -or
+                (Get-ObjectProperty $file 'path') -ne $path -or
+                (Get-ObjectProperty $file 'encoding') -ne 'base64' -or
+                [string]::IsNullOrWhiteSpace([string](Get-ObjectProperty $file 'content'))) {
+                throw "GitHub lieferte kein gültiges Installer-Manifest: $url"
+            }
+            $bytes = [Convert]::FromBase64String([string]$file.content)
+            $text = [System.Text.UTF8Encoding]::new($false, $true).GetString($bytes)
+            if ([string]::IsNullOrWhiteSpace($text)) { throw "Leeres Installer-Manifest: $url" }
             Write-Host "Installer-Manifest in winget-pkgs gefunden ($branch): $V"
             return [pscustomobject]@{
                 Exists = $true
                 Branch = $branch
-                Url = $url
-                Text = [string]$response.Content
+                Url = "https://github.com/microsoft/winget-pkgs/blob/$branch/$path"
+                Text = $text
             }
         }
         if ($status -ne 404) { throw "Unerwarteter HTTP-Status $status für $url" }
