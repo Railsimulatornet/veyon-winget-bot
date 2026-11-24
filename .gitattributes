@@ -1,0 +1,2 @@
+# Eigene Python-Skripte bei der Spracherkennung berücksichtigen.
+.github/scripts/**/*.py -linguist-vendored
