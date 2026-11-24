@@ -25,7 +25,7 @@ Damit erhält mein Veyon WinGet Updater passende Manifeste und aktuelle Prüfsum
 
 ### Voraussetzungen
 
-Der Workflow läuft über GitHub Actions. Die Synchronisierung ist auf den Fork `Railsimulatornet/winget-pkgs` und dessen Branch `master` eingestellt. Eigene Commits auf diesem Branch führen zum Abbruch; sie werden nicht automatisch überschrieben. Änderungen an der Fork-Dokumentation deshalb auf einem eigenen Branch halten.
+Der Workflow läuft über GitHub Actions. Die Synchronisierung ist auf den Fork `Railsimulatornet/winget-pkgs` und dessen Branch `master` eingestellt. Upstream-Änderungen werden mit einem normalen Merge übernommen; eigene Commits bleiben erhalten. Bei Konflikten oder einem unerwarteten Verlauf stoppt der Vorgang. Die festgelegte WingetCreate-Version erzeugt Einreichungsbranches direkt aus Microsofts `master`, damit eigene Fork-Dateien nicht in Paket-PRs gelangen.
 
 Für lokale Prüfungen brauchst du PowerShell 7. Die CI verwendet die festgelegte WingetCreate-Version `1.12.13.0` und prüft das heruntergeladene Programm sowie dessen Version.
 
@@ -107,7 +107,7 @@ This provides matching manifests and current checksums for my Veyon WinGet Updat
 
 ### Requirements
 
-The workflow runs in GitHub Actions. Fork synchronization is configured for `Railsimulatornet/winget-pkgs` and its `master` branch. Additional commits on that branch stop the process; they are never overwritten automatically. Keep changes to the fork's documentation on a separate branch.
+The workflow runs in GitHub Actions. Fork synchronization is configured for `Railsimulatornet/winget-pkgs` and its `master` branch. Upstream changes are incorporated with a normal merge, preserving existing fork commits. Conflicts or unexpected history changes stop the process. The pinned WingetCreate version creates submission branches directly from Microsoft's `master`, keeping fork-specific files out of package PRs.
 
 Local checks require PowerShell 7. CI uses the pinned WingetCreate version `1.12.13.0` and verifies both the downloaded program and its version.
 

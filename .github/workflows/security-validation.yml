@@ -58,6 +58,12 @@ jobs:
         shell: pwsh
         run: pwsh -NoProfile -NonInteractive -File tests/Test-ManifestRead.ps1
 
+      - name: Test fork synchronization without external requests
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -NonInteractive -File tests/Test-ForkSync.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'Offline fork-sync regression failed.' }
+
       - name: Enforce immutable external Action references
         shell: pwsh
         run: |
